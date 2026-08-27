@@ -1,9 +1,11 @@
+#include "cpu_baseline.h"
 #include "pipeline.h"
 #include "video_io.h"
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -22,7 +24,18 @@ struct Options {
     int warmup = 30;
     bool save_frames = false;
     bool debug_sync = false;
+    bool validate = false;
 };
+
+// GPU/CPU agreement threshold, on an 8-bit scale. Exact equality is not
+// achievable and not the goal: OpenCV's cvtColor uses fixed-point coefficients
+// that differ slightly from the exact BT.601 constants, and float summation
+// order differs between the two implementations. A mean absolute error below
+// one level means the two agree to within rounding on essentially every pixel.
+//
+// This threshold is NOT to be relaxed to make a failing kernel pass. If a stage
+// exceeds it, the kernel is wrong.
+constexpr double kValidationTolerance = 1.0;
 
 void print_usage() {
     std::printf(
@@ -39,6 +52,8 @@ void print_usage() {
         "                    (default 30; clock speeds need this to settle)\n"
         "  --save-frames     write a lossless PNG of each pipeline stage for\n"
         "                    the first processed frame, into results/\n"
+        "  --validate        run the OpenCV CPU baseline alongside, report\n"
+        "                    per-stage error and CPU/GPU timings, then exit\n"
         "  --debug-sync      synchronize after every kernel launch (slower;\n"
         "                    attributes a fault to the launch that caused it)\n"
         "  --help            show this message\n");
@@ -78,6 +93,8 @@ bool parse_args(int argc, char** argv, Options& opt, std::string& err) {
             if (!value_for("--output", opt.output)) return false;
         } else if (arg == "--save-frames") {
             opt.save_frames = true;
+        } else if (arg == "--validate") {
+            opt.validate = true;
         } else if (arg == "--debug-sync") {
             opt.debug_sync = true;
         } else if (arg == "--ksize") {
@@ -166,6 +183,105 @@ void print_fps_line(const char* label, double ms, const char* note) {
                 ms > 0.0 ? 1000.0 / ms : 0.0, note);
 }
 
+// Runs the CPU baseline alongside the GPU and reports per-stage agreement.
+//
+// Per-stage rather than final-only: an error in grayscale propagates through
+// blur into Sobel, so comparing only the edge map tells you something is wrong
+// but not which kernel is responsible.
+int run_validate(const Options& opt) {
+    frameflow::VideoReader reader(opt.input);
+    const frameflow::VideoInfo& info = reader.info();
+
+    // Per-launch synchronization while validating, so a fault is reported at
+    // the launch that caused it. This makes the GPU timings below unsuitable
+    // as benchmark figures, which is stated where they are printed.
+    frameflow::set_debug_sync(true);
+    print_header(info, opt);
+
+    frameflow::GpuPipeline pipeline(info.width, info.height, opt.ksize, opt.sigma);
+    frameflow::CpuBaseline cpu(opt.ksize, opt.sigma);
+
+    const long long limit = opt.frames > 0 ? opt.frames : 20;
+
+    cv::Mat frame, gpu_gray, gpu_blur, gpu_edges, cpu_gray, cpu_blur, cpu_edges;
+    frameflow::FrameTimings gt{}, gpu_total{};
+    frameflow::CpuTimings ct{}, cpu_total{};
+
+    const char* names[3] = {"Grayscale", "Blur", "Sobel"};
+    double sum_mean[3] = {0.0, 0.0, 0.0};
+    double worst_max[3] = {0.0, 0.0, 0.0};
+    long long worst_over1[3] = {0, 0, 0};
+    long long n = 0;
+
+    while (n < limit && reader.read(frame)) {
+        pipeline.process(frame, gpu_edges, gt);
+        pipeline.download_grayscale(gpu_gray);
+        pipeline.download_blurred(gpu_blur);
+
+        cpu.process(frame, cpu_gray, cpu_blur, cpu_edges, ct);
+
+        const frameflow::StageError e[3] = {
+            frameflow::compare_u8(gpu_gray, cpu_gray),
+            frameflow::compare_u8(gpu_blur, cpu_blur),
+            frameflow::compare_u8(gpu_edges, cpu_edges),
+        };
+        for (int i = 0; i < 3; ++i) {
+            sum_mean[i] += e[i].mean_abs;
+            worst_max[i] = std::max(worst_max[i], e[i].max_abs);
+            worst_over1[i] = std::max(worst_over1[i], e[i].over_one);
+        }
+
+        gpu_total.accumulate(gt);
+        cpu_total.accumulate(ct);
+        ++n;
+    }
+
+    if (n == 0) {
+        std::fprintf(stderr, "\nerror: no frames were decoded from '%s'\n",
+                     opt.input.c_str());
+        return EXIT_FAILURE;
+    }
+
+    gpu_total.divide(static_cast<double>(n));
+    cpu_total.divide(static_cast<double>(n));
+
+    bool passed = true;
+    for (int i = 0; i < 3; ++i) {
+        if (sum_mean[i] / static_cast<double>(n) > kValidationTolerance) passed = false;
+    }
+
+    std::printf("\nValidation  (%lld frames, GPU vs OpenCV CPU baseline)\n", n);
+    std::printf("------------------------\n");
+    std::printf("Border mode: BORDER_REFLECT_101 on both sides\n");
+    std::printf("Border pixels excluded: 0 (full-image comparison, %lld px/frame)\n",
+                static_cast<long long>(info.width) * info.height);
+    std::printf("Tolerance: mean absolute error <= %.1f on an 8-bit scale\n\n",
+                kValidationTolerance);
+    std::printf("%-12s %12s %12s %16s\n", "stage", "mean abs", "max abs", "px differing >1");
+    for (int i = 0; i < 3; ++i) {
+        std::printf("%-12s %12.5f %12.0f %16lld\n", names[i],
+                    sum_mean[i] / static_cast<double>(n), worst_max[i], worst_over1[i]);
+    }
+    std::printf("\nGPU vs CPU (OpenCV): %s\n", passed ? "PASSED" : "FAILED");
+
+    std::printf("\nTiming  (per frame; GPU figures are NOT benchmark numbers --\n");
+    std::printf("         --validate forces a synchronize after every launch)\n");
+    std::printf("------------------------\n");
+    std::printf("%-12s %10s %10s %10s\n", "stage", "GPU ms", "CPU ms", "speedup");
+    const double g[3] = {gpu_total.gray_ms, gpu_total.blur_ms, gpu_total.sobel_ms};
+    const double c[3] = {cpu_total.gray_ms, cpu_total.blur_ms, cpu_total.sobel_ms};
+    for (int i = 0; i < 3; ++i) {
+        std::printf("%-12s %10.3f %10.3f %9.1fx\n", names[i], g[i], c[i],
+                    g[i] > 0.0 ? c[i] / g[i] : 0.0);
+    }
+    std::printf("%-12s %10.3f %10.3f %9.1fx\n", "TOTAL", gpu_total.kernel_ms,
+                cpu_total.total_ms,
+                gpu_total.kernel_ms > 0.0 ? cpu_total.total_ms / gpu_total.kernel_ms : 0.0);
+    std::printf("\n");
+
+    return passed ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -179,6 +295,8 @@ int main(int argc, char** argv) {
     frameflow::set_debug_sync(opt.debug_sync);
 
     try {
+        if (opt.validate) return run_validate(opt);
+
         frameflow::VideoReader reader(opt.input);
         const frameflow::VideoInfo& info = reader.info();
         print_header(info, opt);

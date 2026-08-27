@@ -42,6 +42,7 @@ find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs videoio)
 add_executable(frameflow
   src/main.cpp
   src/video_io.cpp
+  src/cpu_baseline.cpp
   src/kernels.cu
   src/pipeline.cu
 )
