@@ -13,27 +13,26 @@ namespace frameflow {
 void set_debug_sync(bool enabled);
 bool debug_sync();
 
-// Per-frame GPU timings, in milliseconds, measured with cudaEvent records.
+// Per-frame GPU timings in milliseconds, measured with cudaEvent records.
 // Host clocks are not used for GPU work: kernel launches are asynchronous, so a
 // host timer around a launch measures the launch call, not the kernel.
+//
+// CAVEAT on kernel_ms: the uploads and downloads here are synchronous copies
+// from pageable host memory, so the GPU is idle at the moment the post-upload
+// event is recorded. kernel_ms therefore includes the host-side launch latency
+// of the first kernel in the chain, and is a slight OVER-estimate of pure
+// compute. Pinned memory plus async copies would remove this; that is Tier 3.
 struct FrameTimings {
-    float upload_ms = 0.0f;   // host -> device
-    float kernel_ms = 0.0f;   // all kernels, transfers excluded
-    float download_ms = 0.0f; // device -> host
-    float gpu_total_ms = 0.0f;// upload + kernels + download
+    float upload_ms = 0.0f;
+    float gray_ms = 0.0f;
+    float blur_ms = 0.0f;
+    float sobel_ms = 0.0f;
+    float kernel_ms = 0.0f;    // gray + blur + sobel
+    float download_ms = 0.0f;
+    float gpu_total_ms = 0.0f; // upload + kernels + download
 
-    void accumulate(const FrameTimings& t) {
-        upload_ms += t.upload_ms;
-        kernel_ms += t.kernel_ms;
-        download_ms += t.download_ms;
-        gpu_total_ms += t.gpu_total_ms;
-    }
-    void divide(double n) {
-        upload_ms = static_cast<float>(upload_ms / n);
-        kernel_ms = static_cast<float>(kernel_ms / n);
-        download_ms = static_cast<float>(download_ms / n);
-        gpu_total_ms = static_cast<float>(gpu_total_ms / n);
-    }
+    void accumulate(const FrameTimings& t);
+    void divide(double n);
 };
 
 // Owns every device allocation for the pipeline and reuses them across frames.
@@ -41,32 +40,45 @@ struct FrameTimings {
 // synchronizing -- inside the measured loop and dominate the timings.
 class GpuPipeline {
 public:
-    GpuPipeline(int width, int height);
+    // ksize must be positive and odd. sigma <= 0 selects OpenCV's default
+    // sigma-from-ksize rule so the two implementations still agree.
+    GpuPipeline(int width, int height, int ksize, double sigma);
     ~GpuPipeline();
 
     GpuPipeline(const GpuPipeline&) = delete;
     GpuPipeline& operator=(const GpuPipeline&) = delete;
 
-    // Uploads one BGR frame, runs the pipeline on-device, and downloads the
-    // result. `out` is resized to CV_8UC1. No intermediate result returns to
-    // the host: every stage reads and writes device memory.
+    // Uploads one BGR frame, runs grayscale -> blur -> Sobel entirely on the
+    // device, and downloads the final edge map. `out` is resized to CV_8UC1.
+    // No intermediate result returns to the host.
     void process(const cv::Mat& bgr, cv::Mat& out, FrameTimings& timings);
+
+    // Copies an intermediate stage back to the host. For --save-frames and for
+    // per-stage validation only; never called inside a timed loop.
+    void download_grayscale(cv::Mat& out) const;
+    void download_blurred(cv::Mat& out) const;
 
     int width() const { return width_; }
     int height() const { return height_; }
+    int ksize() const { return ksize_; }
+    double sigma() const { return sigma_; }
 
 private:
+    void free_all() noexcept;
+
     int width_ = 0;
     int height_ = 0;
+    int ksize_ = 5;
+    double sigma_ = 1.4;
 
-    uint8_t* d_bgr_ = nullptr;   // width*height*3
-    uint8_t* d_gray_ = nullptr;  // width*height
+    uint8_t* d_bgr_ = nullptr;    // width*height*3
+    uint8_t* d_gray_ = nullptr;   // width*height
+    uint8_t* d_blur_ = nullptr;   // width*height
+    uint8_t* d_edges_ = nullptr;  // width*height
+    float* d_weights2d_ = nullptr;// ksize*ksize
 
     // Reused across frames; creating events per frame is a measurable cost.
-    void* ev_start_ = nullptr;
-    void* ev_after_upload_ = nullptr;
-    void* ev_after_kernels_ = nullptr;
-    void* ev_end_ = nullptr;
+    void* ev_[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
 };
 
 }  // namespace frameflow
