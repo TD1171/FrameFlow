@@ -62,6 +62,42 @@ std::vector<float> gaussian_kernel_2d(int ksize, double sigma) {
     return w2;
 }
 
+// ---------------------------------------------------------------------------
+// Filter weights in __constant__ memory.
+//
+// This is the textbook case for constant memory. The weights are small,
+// read-only for the lifetime of a launch, and every thread in a warp reads the
+// SAME element at the same time (the loop index k is uniform across the warp).
+// Constant memory is backed by a dedicated per-SM cache that broadcasts one
+// value to all threads of a warp in a single transaction. Reading the same
+// value from global memory instead costs an L1 lookup per access and consumes
+// L1 capacity that the image data could use.
+//
+// Sized for the maximum supported kernel (31, enforced in GpuPipeline):
+//   1D: 31 floats  = 124 bytes
+//   2D: 31*31      = 3,844 bytes
+// against a 64 KB constant bank, so the reservation is not a constraint.
+//
+// __constant__ arrays are statically sized and file-scope by necessity: their
+// addresses must be known at compile time. That is why these are here rather
+// than being passed as parameters like the image buffers.
+// ---------------------------------------------------------------------------
+namespace {
+constexpr int kMaxKsize = 31;
+}
+
+__constant__ float c_weights1d[kMaxKsize];
+__constant__ float c_weights2d[kMaxKsize * kMaxKsize];
+
+void upload_filter_weights(const std::vector<float>& w1d, const std::vector<float>& w2d) {
+    if (w1d.size() > static_cast<size_t>(kMaxKsize) ||
+        w2d.size() > static_cast<size_t>(kMaxKsize) * kMaxKsize) {
+        throw std::runtime_error("filter too large for the constant memory reservation");
+    }
+    CUDA_CHECK(cudaMemcpyToSymbol(c_weights1d, w1d.data(), w1d.size() * sizeof(float)));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_weights2d, w2d.data(), w2d.size() * sizeof(float)));
+}
+
 namespace {
 
 // BT.601 luminance weights, indexed to match BGR byte order.
@@ -155,7 +191,6 @@ __global__ void bgrToGrayscale(const uint8_t* __restrict__ bgr,
 // ---------------------------------------------------------------------------
 __global__ void gaussianBlurNaive(const uint8_t* __restrict__ src,
                                   uint8_t* __restrict__ dst,
-                                  const float* __restrict__ weights,
                                   int ksize, int width, int height) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -168,7 +203,7 @@ __global__ void gaussianBlurNaive(const uint8_t* __restrict__ src,
         const int sy = reflect101(y + ky, height);
         for (int kx = -radius; kx <= radius; ++kx) {
             const int sx = reflect101(x + kx, width);
-            acc += weights[(ky + radius) * ksize + (kx + radius)] *
+            acc += c_weights2d[(ky + radius) * ksize + (kx + radius)] *
                    static_cast<float>(src[sy * width + sx]);
         }
     }
@@ -185,7 +220,6 @@ __global__ void gaussianBlurNaive(const uint8_t* __restrict__ src,
 // ---------------------------------------------------------------------------
 __global__ void gaussianBlurHorizontal(const uint8_t* __restrict__ src,
                                        float* __restrict__ dst,
-                                       const float* __restrict__ w,
                                        int ksize, int width, int height) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -195,7 +229,7 @@ __global__ void gaussianBlurHorizontal(const uint8_t* __restrict__ src,
     const int row = y * width;
     float acc = 0.0f;
     for (int k = -radius; k <= radius; ++k) {
-        acc += w[k + radius] * static_cast<float>(src[row + reflect101(x + k, width)]);
+        acc += c_weights1d[k + radius] * static_cast<float>(src[row + reflect101(x + k, width)]);
     }
     dst[row + x] = acc;  // kept in float; see the note in kernels.cuh
 }
@@ -210,7 +244,6 @@ __global__ void gaussianBlurHorizontal(const uint8_t* __restrict__ src,
 // ---------------------------------------------------------------------------
 __global__ void gaussianBlurVertical(const float* __restrict__ src,
                                      uint8_t* __restrict__ dst,
-                                     const float* __restrict__ w,
                                      int ksize, int width, int height) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -219,7 +252,7 @@ __global__ void gaussianBlurVertical(const float* __restrict__ src,
     const int radius = ksize / 2;
     float acc = 0.0f;
     for (int k = -radius; k <= radius; ++k) {
-        acc += w[k + radius] * src[reflect101(y + k, height) * width + x];
+        acc += c_weights1d[k + radius] * src[reflect101(y + k, height) * width + x];
     }
     dst[y * width + x] = to_u8(acc);
 }
@@ -251,7 +284,6 @@ __global__ void gaussianBlurVertical(const float* __restrict__ src,
 // ---------------------------------------------------------------------------
 __global__ void gaussianBlurHorizontalShared(const uint8_t* __restrict__ src,
                                              float* __restrict__ dst,
-                                             const float* __restrict__ w,
                                              int ksize, int width, int height) {
     extern __shared__ float tile[];
 
@@ -273,7 +305,7 @@ __global__ void gaussianBlurHorizontalShared(const uint8_t* __restrict__ src,
 
     float acc = 0.0f;
     for (int k = 0; k < ksize; ++k) {
-        acc += w[k] * tile[threadIdx.y * tileW + threadIdx.x + k];
+        acc += c_weights1d[k] * tile[threadIdx.y * tileW + threadIdx.x + k];
     }
     dst[y * width + x] = acc;
 }
@@ -295,7 +327,6 @@ __global__ void gaussianBlurHorizontalShared(const uint8_t* __restrict__ src,
 // ---------------------------------------------------------------------------
 __global__ void gaussianBlurVerticalShared(const float* __restrict__ src,
                                            uint8_t* __restrict__ dst,
-                                           const float* __restrict__ w,
                                            int ksize, int width, int height) {
     extern __shared__ float tile[];
 
@@ -317,7 +348,7 @@ __global__ void gaussianBlurVerticalShared(const float* __restrict__ src,
 
     float acc = 0.0f;
     for (int k = 0; k < ksize; ++k) {
-        acc += w[k] * tile[(threadIdx.y + k) * blockDim.x + threadIdx.x];
+        acc += c_weights1d[k] * tile[(threadIdx.y + k) * blockDim.x + threadIdx.x];
     }
     dst[y * width + x] = to_u8(acc);
 }
@@ -438,34 +469,31 @@ void launch_bgr_to_grayscale(const uint8_t* d_bgr, uint8_t* d_gray,
     CUDA_CHECK_KERNEL("bgrToGrayscale");
 }
 
-void launch_gaussian_blur_naive(const uint8_t* d_src, uint8_t* d_dst,
-                                const float* d_weights2d, int ksize,
+void launch_gaussian_blur_naive(const uint8_t* d_src, uint8_t* d_dst, int ksize,
                                 int width, int height, cudaStream_t stream) {
     gaussianBlurNaive<<<grid_for(width, height), dim3(kBlockX, kBlockY), 0, stream>>>(
-        d_src, d_dst, d_weights2d, ksize, width, height);
+        d_src, d_dst, ksize, width, height);
     CUDA_CHECK_KERNEL("gaussianBlurNaive");
 }
 
 void launch_gaussian_blur_separable(const uint8_t* d_src, float* d_tmp, uint8_t* d_dst,
-                                    const float* d_weights1d, int ksize,
+                                    int ksize,
                                     int width, int height, cudaStream_t stream) {
     const dim3 grid = grid_for(width, height);
     const dim3 block(kBlockX, kBlockY);
 
-    gaussianBlurHorizontal<<<grid, block, 0, stream>>>(d_src, d_tmp, d_weights1d,
-                                                       ksize, width, height);
+    gaussianBlurHorizontal<<<grid, block, 0, stream>>>(d_src, d_tmp, ksize, width, height);
     CUDA_CHECK_KERNEL("gaussianBlurHorizontal");
 
     // The vertical pass reads what the horizontal pass wrote. Both are issued
     // into the same stream, and work in a stream executes in order, so no
     // explicit synchronization is needed between them.
-    gaussianBlurVertical<<<grid, block, 0, stream>>>(d_tmp, d_dst, d_weights1d,
-                                                     ksize, width, height);
+    gaussianBlurVertical<<<grid, block, 0, stream>>>(d_tmp, d_dst, ksize, width, height);
     CUDA_CHECK_KERNEL("gaussianBlurVertical");
 }
 
 void launch_gaussian_blur_shared(const uint8_t* d_src, float* d_tmp, uint8_t* d_dst,
-                                 const float* d_weights1d, int ksize,
+                                 int ksize,
                                  int width, int height, cudaStream_t stream) {
     const dim3 grid = grid_for(width, height);
     const dim3 block(kBlockX, kBlockY);
@@ -480,11 +508,11 @@ void launch_gaussian_blur_shared(const uint8_t* d_src, float* d_tmp, uint8_t* d_
                            static_cast<size_t>(kBlockX) * sizeof(float);
 
     gaussianBlurHorizontalShared<<<grid, block, h_bytes, stream>>>(
-        d_src, d_tmp, d_weights1d, ksize, width, height);
+        d_src, d_tmp, ksize, width, height);
     CUDA_CHECK_KERNEL("gaussianBlurHorizontalShared");
 
     gaussianBlurVerticalShared<<<grid, block, v_bytes, stream>>>(
-        d_tmp, d_dst, d_weights1d, ksize, width, height);
+        d_tmp, d_dst, ksize, width, height);
     CUDA_CHECK_KERNEL("gaussianBlurVerticalShared");
 }
 

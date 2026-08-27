@@ -94,8 +94,12 @@ private:
     uint8_t* d_blur_ = nullptr;   // width*height
     uint8_t* d_edges_ = nullptr;  // width*height
     float* d_tmp_ = nullptr;      // width*height, separable intermediate
-    float* d_weights2d_ = nullptr;// ksize*ksize, naive
-    float* d_weights1d_ = nullptr;// ksize, separable and shared
+
+    // Filter weights are NOT stored per object: they live in __constant__
+    // memory, which belongs to the module. This counter enforces that only one
+    // pipeline is live at a time, so a second one cannot overwrite the first's
+    // weights and silently make it compute the wrong filter.
+    static int live_instances_;
 
     // Reused across frames; creating events per frame is a measurable cost.
     void* ev_[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};

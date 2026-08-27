@@ -76,15 +76,25 @@ void GpuPipeline::free_all() noexcept {
     if (d_blur_) { cudaFree(d_blur_); d_blur_ = nullptr; }
     if (d_edges_) { cudaFree(d_edges_); d_edges_ = nullptr; }
     if (d_tmp_) { cudaFree(d_tmp_); d_tmp_ = nullptr; }
-    if (d_weights2d_) { cudaFree(d_weights2d_); d_weights2d_ = nullptr; }
-    if (d_weights1d_) { cudaFree(d_weights1d_); d_weights1d_ = nullptr; }
     for (auto& e : ev_) {
         if (e) { cudaEventDestroy(ev(e)); e = nullptr; }
     }
 }
 
+// Filter weights live in __constant__ memory, which belongs to the module
+// rather than to any object. A second live pipeline with a different ksize or
+// sigma would overwrite the first one's weights, and the first would then
+// silently produce results for the wrong filter. Constructing two is refused
+// rather than left as an undocumented rule.
+int GpuPipeline::live_instances_ = 0;
+
 GpuPipeline::GpuPipeline(int width, int height, int ksize, double sigma, Variant variant)
     : width_(width), height_(height), ksize_(ksize), sigma_(sigma), variant_(variant) {
+    if (live_instances_ > 0) {
+        throw std::runtime_error("only one GpuPipeline may exist at a time: filter "
+                                 "weights are held in __constant__ memory, which is "
+                                 "shared by the whole module");
+    }
     if (width <= 0 || height <= 0) {
         throw std::runtime_error("GpuPipeline requires a positive frame size");
     }
@@ -111,15 +121,10 @@ GpuPipeline::GpuPipeline(int width, int height, int ksize, double sigma, Variant
         // 1D passes do not quantize twice. See kernels.cuh for the trade-off.
         CUDA_CHECK(cudaMalloc(&d_tmp_, pixels * sizeof(float)));
 
-        const std::vector<float> w2 = gaussian_kernel_2d(ksize, sigma);
-        CUDA_CHECK(cudaMalloc(&d_weights2d_, w2.size() * sizeof(float)));
-        CUDA_CHECK(cudaMemcpy(d_weights2d_, w2.data(), w2.size() * sizeof(float),
-                              cudaMemcpyHostToDevice));
-
-        const std::vector<float> w1 = gaussian_kernel_1d(ksize, sigma);
-        CUDA_CHECK(cudaMalloc(&d_weights1d_, w1.size() * sizeof(float)));
-        CUDA_CHECK(cudaMemcpy(d_weights1d_, w1.data(), w1.size() * sizeof(float),
-                              cudaMemcpyHostToDevice));
+        // Weights go to __constant__ memory, which is a single per-module
+        // resource -- see the live-instance guard above.
+        upload_filter_weights(gaussian_kernel_1d(ksize, sigma),
+                              gaussian_kernel_2d(ksize, sigma));
 
         for (auto& slot : ev_) {
             cudaEvent_t e = nullptr;
@@ -130,9 +135,16 @@ GpuPipeline::GpuPipeline(int width, int height, int ksize, double sigma, Variant
         free_all();
         throw;
     }
+
+    // Incremented last: a pipeline that failed to construct never ran its
+    // destructor, so counting it earlier would leak the slot permanently.
+    ++live_instances_;
 }
 
-GpuPipeline::~GpuPipeline() { free_all(); }
+GpuPipeline::~GpuPipeline() {
+    free_all();
+    if (live_instances_ > 0) --live_instances_;
+}
 
 void GpuPipeline::process(const cv::Mat& bgr, cv::Mat& out, FrameTimings& timings) {
     if (bgr.empty()) throw std::runtime_error("GpuPipeline::process got an empty frame");
@@ -165,16 +177,16 @@ void GpuPipeline::process(const cv::Mat& bgr, cv::Mat& out, FrameTimings& timing
 
     switch (variant_) {
         case Variant::Naive:
-            launch_gaussian_blur_naive(d_gray_, d_blur_, d_weights2d_, ksize_,
-                                       width_, height_, /*stream=*/0);
+            launch_gaussian_blur_naive(d_gray_, d_blur_, ksize_, width_, height_,
+                                       /*stream=*/0);
             break;
         case Variant::Separable:
-            launch_gaussian_blur_separable(d_gray_, d_tmp_, d_blur_, d_weights1d_,
-                                           ksize_, width_, height_, /*stream=*/0);
+            launch_gaussian_blur_separable(d_gray_, d_tmp_, d_blur_, ksize_,
+                                           width_, height_, /*stream=*/0);
             break;
         case Variant::Shared:
-            launch_gaussian_blur_shared(d_gray_, d_tmp_, d_blur_, d_weights1d_,
-                                        ksize_, width_, height_, /*stream=*/0);
+            launch_gaussian_blur_shared(d_gray_, d_tmp_, d_blur_, ksize_,
+                                        width_, height_, /*stream=*/0);
             break;
     }
     CUDA_CHECK(cudaEventRecord(ev(ev_[kAfterBlur])));

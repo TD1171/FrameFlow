@@ -24,6 +24,16 @@ std::vector<float> gaussian_kernel_1d(int ksize, double sigma);
 // separable variant exploits later.
 std::vector<float> gaussian_kernel_2d(int ksize, double sigma);
 
+// Copies the filter weights into __constant__ memory. Must be called before any
+// blur launch, and again whenever ksize or sigma changes.
+//
+// IMPORTANT: __constant__ memory is a single per-module resource, not per
+// object. Two GpuPipeline instances with different filters would overwrite each
+// other's weights, and the second construction would silently corrupt the
+// first's results. GpuPipeline enforces that only one instance is live at a
+// time rather than leaving that to convention.
+void upload_filter_weights(const std::vector<float>& w1d, const std::vector<float>& w2d);
+
 // ---------------------------------------------------------------------------
 // Stage 1: BGR -> grayscale
 //
@@ -46,8 +56,7 @@ void launch_bgr_to_grayscale(const uint8_t* d_bgr, uint8_t* d_gray,
 // re-read almost the same neighbourhood, so the same bytes cross the memory bus
 // many times. This is the baseline the later variants are measured against.
 // ---------------------------------------------------------------------------
-void launch_gaussian_blur_naive(const uint8_t* d_src, uint8_t* d_dst,
-                                const float* d_weights2d, int ksize,
+void launch_gaussian_blur_naive(const uint8_t* d_src, uint8_t* d_dst, int ksize,
                                 int width, int height, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
@@ -74,8 +83,8 @@ void launch_gaussian_blur_naive(const uint8_t* d_src, uint8_t* d_dst,
 // trade-off, made in favour of the variants being numerically comparable.
 // ---------------------------------------------------------------------------
 void launch_gaussian_blur_separable(const uint8_t* d_src, float* d_tmp, uint8_t* d_dst,
-                                    const float* d_weights1d, int ksize,
-                                    int width, int height, cudaStream_t stream);
+                                    int ksize, int width, int height,
+                                    cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 // Stage 2: Gaussian blur -- shared-memory tiled variant (separable + tiling)
@@ -104,8 +113,8 @@ void launch_gaussian_blur_separable(const uint8_t* d_src, float* d_tmp, uint8_t*
 // reserve shared memory that small filters never use.
 // ---------------------------------------------------------------------------
 void launch_gaussian_blur_shared(const uint8_t* d_src, float* d_tmp, uint8_t* d_dst,
-                                 const float* d_weights1d, int ksize,
-                                 int width, int height, cudaStream_t stream);
+                                 int ksize, int width, int height,
+                                 cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 // Stage 3: Sobel -- shared-memory tiled variant
