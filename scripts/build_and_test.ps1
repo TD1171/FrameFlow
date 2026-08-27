@@ -122,32 +122,63 @@ foreach ($res in @(@{w=320; h=240; tag="aligned 320x240"},
 #
 # Add new variants to this list as they are implemented; a variant that is not
 # listed here is not covered by the equivalence guarantee.
-$variants = @("naive", "separable")
+$variants = @("naive", "separable", "shared")
 $variantClip = Join-Path $scratch "variant_clip.mp4"
 $variantPngs = @()
 
-Step "generate clip (variant comparison)" {
+# 642x482 on purpose, NOT 640x480. The tiled kernels use 16x16 blocks, and
+# 642/16 = 40.125, 482/16 = 30.125, so the last tile in each dimension is
+# partial. That is exactly where halo loading goes wrong: a tile whose threads
+# partly fall outside the image must still load a full halo for the threads
+# that are inside it. An exact-multiple resolution would never exercise that
+# path, and the agreement between variants would be meaningless.
+Step "generate clip (variant comparison, unaligned 642x482)" {
     python (Join-Path $repo "scripts\generate_test_video.py") `
-        --output $variantClip --width 640 --height 480 --frames 4 --fps 30 | Out-Null
+        --output $variantClip --width 642 --height 482 --frames 4 --fps 30 | Out-Null
     if (-not (Test-Path $variantClip)) { throw "generator produced no file" }
 }
+
+$variantBlurPngs = @()
 
 foreach ($v in $variants) {
     Step "variant '$v' runs" {
         & $exe --input $variantClip --frames 1 --warmup 2 --kernel $v --save-frames | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "frameflow --kernel $v exited $LASTEXITCODE" }
-        $srcPng = Join-Path $repo "results\stage3_edges.png"
-        if (-not (Test-Path $srcPng)) { throw "no edge PNG produced" }
-        $dstPng = Join-Path $scratch "$v.png"
-        Copy-Item $srcPng $dstPng -Force
-        $script:variantPngs += $dstPng
+        foreach ($stage in @(@{src="stage2_blurred.png"; dst="blur_$v.png"},
+                             @{src="stage3_edges.png";  dst="edge_$v.png"})) {
+            $srcPng = Join-Path $repo "results\$($stage.src)"
+            if (-not (Test-Path $srcPng)) { throw "no $($stage.src) produced" }
+            Copy-Item $srcPng (Join-Path $scratch $stage.dst) -Force
+        }
+        $script:variantBlurPngs += (Join-Path $scratch "blur_$v.png")
+        $script:variantPngs += (Join-Path $scratch "edge_$v.png")
     }
 }
 
-Step "all variants agree" {
-    if ($variantPngs.Count -lt 2) { throw "fewer than two variant images to compare" }
-    python (Join-Path $repo "scripts\compare_variants.py") @variantPngs --tol 1
-    if ($LASTEXITCODE -ne 0) { throw "variants disagree" }
+# The blur stage is compared directly, at a tolerance of one level. This is the
+# check that actually tests the blur variants: it is not distorted by anything
+# downstream.
+Step "blur variants agree (tolerance 1)" {
+    if ($variantBlurPngs.Count -lt 2) { throw "fewer than two blur images to compare" }
+    python (Join-Path $repo "scripts\compare_variants.py") @variantBlurPngs --tol 1
+    if ($LASTEXITCODE -ne 0) { throw "blur variants disagree" }
+}
+
+# The edge stage tolerates 8, not 1, and the reason is arithmetic rather than
+# convenience. The Sobel weights sum to 8 in absolute value (1+2+1 on each
+# side), so a one-level disagreement in the blurred input can move the gradient
+# magnitude by up to 8 levels. naive and separable legitimately differ by one
+# level at rare pixels because floating-point addition is not associative: the
+# naive kernel sums 25 terms at once, the separable kernel sums two groups of
+# five. Requiring 1 here would fail on correct code.
+#
+# 8 is the amplification bound, NOT a relaxed threshold to make something pass.
+# If a tiled kernel had a halo bug, it would differ from separable across whole
+# tile borders -- many pixels, not one -- and would still fail this check.
+Step "edge variants agree (tolerance 8, Sobel amplification bound)" {
+    if ($variantPngs.Count -lt 2) { throw "fewer than two edge images to compare" }
+    python (Join-Path $repo "scripts\compare_variants.py") @variantPngs --tol 8
+    if ($LASTEXITCODE -ne 0) { throw "edge variants disagree beyond amplification bound" }
 }
 
 # Negative cases. Each asserts the binary REJECTED its input. The positive cases

@@ -88,13 +88,6 @@ GpuPipeline::GpuPipeline(int width, int height, int ksize, double sigma, Variant
     if (width <= 0 || height <= 0) {
         throw std::runtime_error("GpuPipeline requires a positive frame size");
     }
-    if (variant == Variant::Shared) {
-        // Rejected explicitly rather than silently falling back to separable:
-        // a variant that quietly runs different code than the name says would
-        // corrupt every benchmark comparison that used it.
-        throw std::runtime_error("kernel variant 'shared' is not implemented yet; "
-                                 "use 'naive' or 'separable'");
-    }
     if (ksize <= 0 || ksize % 2 == 0) {
         throw std::runtime_error("--ksize must be positive and odd, got " +
                                  std::to_string(ksize));
@@ -180,12 +173,20 @@ void GpuPipeline::process(const cv::Mat& bgr, cv::Mat& out, FrameTimings& timing
                                            ksize_, width_, height_, /*stream=*/0);
             break;
         case Variant::Shared:
-            // Unreachable: rejected in the constructor.
+            launch_gaussian_blur_shared(d_gray_, d_tmp_, d_blur_, d_weights1d_,
+                                        ksize_, width_, height_, /*stream=*/0);
             break;
     }
     CUDA_CHECK(cudaEventRecord(ev(ev_[kAfterBlur])));
 
-    launch_sobel_naive(d_blur_, d_edges_, width_, height_, /*stream=*/0);
+    // Sobel is tiled only in the 'shared' variant. Per-stage timings are
+    // reported separately, so pairing both changes under one variant name does
+    // not hide which stage the improvement came from.
+    if (variant_ == Variant::Shared) {
+        launch_sobel_shared(d_blur_, d_edges_, width_, height_, /*stream=*/0);
+    } else {
+        launch_sobel_naive(d_blur_, d_edges_, width_, height_, /*stream=*/0);
+    }
     CUDA_CHECK(cudaEventRecord(ev(ev_[kAfterSobel])));
 
     CUDA_CHECK(cudaMemcpy2D(out.data, out.step,

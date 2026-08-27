@@ -78,6 +78,48 @@ void launch_gaussian_blur_separable(const uint8_t* d_src, float* d_tmp, uint8_t*
                                     int width, int height, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
+// Stage 2: Gaussian blur -- shared-memory tiled variant (separable + tiling)
+//
+// Each block cooperatively loads the pixels its threads need into __shared__
+// memory once, calls __syncthreads(), then every thread computes reading only
+// from on-chip memory. The extra border of pixels that edge threads need but
+// that lies outside the block's own output region is the HALO.
+//
+// Geometry, 16x16 block with a 5x5 filter (radius 2):
+//   naive 2D:   256 outputs, 25 global loads each        = 6,400 loads
+//                distinct data actually touched: 20x20   =   400 pixels
+//   tiled 2D:   loads that 20x20 region once             =   400 loads, 16x fewer
+//
+// Because this variant is also separable, the tiles are 1D-shaped rather than
+// square, which is cheaper still:
+//   horizontal pass: (16 + 2*2) x 16 = 20x16 = 320 floats = 1,280 bytes
+//   vertical pass:   16 x (16 + 2*2) = 16x20 = 320 floats = 1,280 bytes
+//
+// At 48 KB of shared memory per block on this GPU, those tiles are nowhere near
+// the limit -- occupancy is bounded by other resources, not by shared memory,
+// so there is no reason to shrink the tile.
+//
+// Shared memory is allocated dynamically because the filter radius is a runtime
+// value (--ksize). Sizing a static array for the maximum supported radius would
+// reserve shared memory that small filters never use.
+// ---------------------------------------------------------------------------
+void launch_gaussian_blur_shared(const uint8_t* d_src, float* d_tmp, uint8_t* d_dst,
+                                 const float* d_weights1d, int ksize,
+                                 int width, int height, cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// Stage 3: Sobel -- shared-memory tiled variant
+//
+// 16x16 block, radius 1, so an 18x18 tile: 324 loads to produce 256 outputs,
+// versus 256*9 = 2,304 in the naive kernel. The saving ratio is smaller than
+// the blur's because a 3x3 stencil has far less overlap between neighbouring
+// threads to begin with -- which is a useful prediction to check against the
+// measurement.
+// ---------------------------------------------------------------------------
+void launch_sobel_shared(const uint8_t* d_src, uint8_t* d_dst,
+                         int width, int height, cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
 // Stage 3: Sobel edge detection -- naive variant
 //
 // 3x3 horizontal and vertical gradients, combined as the true magnitude

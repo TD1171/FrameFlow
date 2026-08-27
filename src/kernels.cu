@@ -225,6 +225,153 @@ __global__ void gaussianBlurVertical(const float* __restrict__ src,
 }
 
 // ---------------------------------------------------------------------------
+// Separable blur, horizontal pass, shared-memory tiled.
+//
+// Shared tile layout: [blockDim.y][blockDim.x + 2*radius], row-major.
+// Only x needs a halo in this pass; y is a plain row index.
+//
+// HALO LOADING STRATEGY. Each thread loads one interior pixel, and the threads
+// with low threadIdx.x additionally load the halo columns, via a grid-stride
+// loop over the tile width:
+//
+//     for (i = threadIdx.x; i < tileW; i += blockDim.x)
+//
+// With blockDim.x = 16 and radius 2, tileW = 20: threads 0..15 load columns
+// 0..15, then threads 0..3 loop again to load columns 16..19. So most threads
+// load once and four load twice. This is chosen over the common alternative
+// ("thread loads its own pixel, then threads 0..2R-1 load the halo") because
+// it needs no separate index arithmetic for the halo and cannot leave a gap if
+// the tile is more than twice the block width.
+//
+// The __syncthreads() below is mandatory: thread 15 reads columns 15..19, which
+// were written by other threads. Without the barrier it could read stale
+// shared memory. Note it sits OUTSIDE the y-bounds guard -- every thread in the
+// block must reach every __syncthreads(), and letting out-of-range threads
+// return early would deadlock the block.
+// ---------------------------------------------------------------------------
+__global__ void gaussianBlurHorizontalShared(const uint8_t* __restrict__ src,
+                                             float* __restrict__ dst,
+                                             const float* __restrict__ w,
+                                             int ksize, int width, int height) {
+    extern __shared__ float tile[];
+
+    const int radius = ksize / 2;
+    const int tileW = blockDim.x + 2 * radius;
+    const int x0 = blockIdx.x * blockDim.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (y < height) {
+        for (int i = threadIdx.x; i < tileW; i += blockDim.x) {
+            const int sx = reflect101(x0 - radius + i, width);
+            tile[threadIdx.y * tileW + i] = static_cast<float>(src[y * width + sx]);
+        }
+    }
+    __syncthreads();
+
+    const int x = x0 + threadIdx.x;
+    if (x >= width || y >= height) return;
+
+    float acc = 0.0f;
+    for (int k = 0; k < ksize; ++k) {
+        acc += w[k] * tile[threadIdx.y * tileW + threadIdx.x + k];
+    }
+    dst[y * width + x] = acc;
+}
+
+// ---------------------------------------------------------------------------
+// Separable blur, vertical pass, shared-memory tiled.
+//
+// Shared tile layout: [blockDim.y + 2*radius][blockDim.x]. Only y needs a halo.
+//
+// This pass benefits more from tiling than the horizontal one does. In the
+// untiled vertical kernel each tap strides a full row (width floats) away, so
+// the ksize taps for one output pixel land in ksize different cache lines. In
+// the tiled version those rows are read once into shared memory and reused by
+// every thread in the column.
+//
+// Keeping x as the fastest-varying index matters here too: consecutive threads
+// read consecutive columns of the same row, so each global load is coalesced
+// even though the tile is tall rather than wide.
+// ---------------------------------------------------------------------------
+__global__ void gaussianBlurVerticalShared(const float* __restrict__ src,
+                                           uint8_t* __restrict__ dst,
+                                           const float* __restrict__ w,
+                                           int ksize, int width, int height) {
+    extern __shared__ float tile[];
+
+    const int radius = ksize / 2;
+    const int tileH = blockDim.y + 2 * radius;
+    const int y0 = blockIdx.y * blockDim.y;
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (x < width) {
+        for (int j = threadIdx.y; j < tileH; j += blockDim.y) {
+            const int sy = reflect101(y0 - radius + j, height);
+            tile[j * blockDim.x + threadIdx.x] = src[sy * width + x];
+        }
+    }
+    __syncthreads();
+
+    const int y = y0 + threadIdx.y;
+    if (x >= width || y >= height) return;
+
+    float acc = 0.0f;
+    for (int k = 0; k < ksize; ++k) {
+        acc += w[k] * tile[(threadIdx.y + k) * blockDim.x + threadIdx.x];
+    }
+    dst[y * width + x] = to_u8(acc);
+}
+
+// ---------------------------------------------------------------------------
+// Sobel, shared-memory tiled. Radius is fixed at 1, so the tile is
+// (blockDim.x + 2) x (blockDim.y + 2) -- 18x18 for a 16x16 block.
+//
+// Both dimensions need a halo here, so the load is a 2D grid-stride loop.
+// Every thread participates in loading regardless of whether its own output
+// pixel is inside the image, because the barrier requires the whole block.
+// ---------------------------------------------------------------------------
+__global__ void sobelShared(const uint8_t* __restrict__ src,
+                            uint8_t* __restrict__ dst,
+                            int width, int height) {
+    extern __shared__ float tile[];
+
+    const int tileW = blockDim.x + 2;
+    const int tileH = blockDim.y + 2;
+    const int x0 = blockIdx.x * blockDim.x;
+    const int y0 = blockIdx.y * blockDim.y;
+
+    for (int j = threadIdx.y; j < tileH; j += blockDim.y) {
+        const int sy = reflect101(y0 - 1 + j, height);
+        for (int i = threadIdx.x; i < tileW; i += blockDim.x) {
+            const int sx = reflect101(x0 - 1 + i, width);
+            tile[j * tileW + i] = static_cast<float>(src[sy * width + sx]);
+        }
+    }
+    __syncthreads();
+
+    const int x = x0 + threadIdx.x;
+    const int y = y0 + threadIdx.y;
+    if (x >= width || y >= height) return;
+
+    const float kx3[3][3] = {{-1.f, 0.f, 1.f}, {-2.f, 0.f, 2.f}, {-1.f, 0.f, 1.f}};
+    const float ky3[3][3] = {{-1.f, -2.f, -1.f}, {0.f, 0.f, 0.f}, {1.f, 2.f, 1.f}};
+
+    float gx = 0.0f;
+    float gy = 0.0f;
+    for (int dy = 0; dy < 3; ++dy) {
+        for (int dx = 0; dx < 3; ++dx) {
+            // +dy/+dx rather than -1..+1: the tile already starts one pixel
+            // above and left of the block's output region.
+            const float v = tile[(threadIdx.y + dy) * tileW + (threadIdx.x + dx)];
+            gx += kx3[dy][dx] * v;
+            gy += ky3[dy][dx] * v;
+        }
+    }
+
+    dst[y * width + x] = to_u8(sqrtf(gx * gx + gy * gy));
+}
+
+// ---------------------------------------------------------------------------
 // Sobel edge detection, naive variant.
 //
 // Standard 3x3 operators. Sign convention matches cv::Sobel, so gx is positive
@@ -315,6 +462,39 @@ void launch_gaussian_blur_separable(const uint8_t* d_src, float* d_tmp, uint8_t*
     gaussianBlurVertical<<<grid, block, 0, stream>>>(d_tmp, d_dst, d_weights1d,
                                                      ksize, width, height);
     CUDA_CHECK_KERNEL("gaussianBlurVertical");
+}
+
+void launch_gaussian_blur_shared(const uint8_t* d_src, float* d_tmp, uint8_t* d_dst,
+                                 const float* d_weights1d, int ksize,
+                                 int width, int height, cudaStream_t stream) {
+    const dim3 grid = grid_for(width, height);
+    const dim3 block(kBlockX, kBlockY);
+    const int radius = ksize / 2;
+
+    // Dynamic shared memory, sized per pass. The horizontal tile is wide, the
+    // vertical tile is tall; sizing each separately avoids reserving the
+    // maximum of the two for both.
+    const size_t h_bytes = static_cast<size_t>(kBlockY) *
+                           static_cast<size_t>(kBlockX + 2 * radius) * sizeof(float);
+    const size_t v_bytes = static_cast<size_t>(kBlockY + 2 * radius) *
+                           static_cast<size_t>(kBlockX) * sizeof(float);
+
+    gaussianBlurHorizontalShared<<<grid, block, h_bytes, stream>>>(
+        d_src, d_tmp, d_weights1d, ksize, width, height);
+    CUDA_CHECK_KERNEL("gaussianBlurHorizontalShared");
+
+    gaussianBlurVerticalShared<<<grid, block, v_bytes, stream>>>(
+        d_tmp, d_dst, d_weights1d, ksize, width, height);
+    CUDA_CHECK_KERNEL("gaussianBlurVerticalShared");
+}
+
+void launch_sobel_shared(const uint8_t* d_src, uint8_t* d_dst,
+                         int width, int height, cudaStream_t stream) {
+    const size_t bytes = static_cast<size_t>(kBlockY + 2) *
+                         static_cast<size_t>(kBlockX + 2) * sizeof(float);
+    sobelShared<<<grid_for(width, height), dim3(kBlockX, kBlockY), bytes, stream>>>(
+        d_src, d_dst, width, height);
+    CUDA_CHECK_KERNEL("sobelShared");
 }
 
 void launch_sobel_naive(const uint8_t* d_src, uint8_t* d_dst,
