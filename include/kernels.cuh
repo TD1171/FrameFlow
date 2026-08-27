@@ -51,6 +51,33 @@ void launch_gaussian_blur_naive(const uint8_t* d_src, uint8_t* d_dst,
                                 int width, int height, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
+// Stage 2: Gaussian blur -- separable variant
+//
+// A 2D Gaussian is the outer product of two 1D Gaussians, so convolving with
+// the KxK filter is equivalent to a horizontal 1D pass followed by a vertical
+// one. That reduces the taps per output pixel from K*K to 2K: at K=5, from 25
+// to 10, a 2.5x reduction in loads. At K=9 it would be 81 vs 18, a 4.5x
+// reduction -- the advantage grows with kernel size.
+//
+// This is an ALGORITHMIC win, independent of memory layout or hardware, and it
+// composes with the tiling optimisation rather than competing with it.
+//
+// It works because the Gaussian is separable. Most filters are not: a general
+// KxK filter matrix has rank > 1 and cannot be factored into two 1D passes.
+// Sobel happens to be separable too ([1,2,1] x [-1,0,1]), but at 3x3 the saving
+// is 9 taps vs 6 and not worth the extra pass and intermediate buffer.
+//
+// The intermediate is float, not uint8. Rounding the horizontal pass to 8 bits
+// before the vertical pass would quantize twice and make this variant disagree
+// with the naive one by more than rounding. That costs 4 bytes per intermediate
+// pixel instead of 1, which partly offsets the traffic saved -- an honest
+// trade-off, made in favour of the variants being numerically comparable.
+// ---------------------------------------------------------------------------
+void launch_gaussian_blur_separable(const uint8_t* d_src, float* d_tmp, uint8_t* d_dst,
+                                    const float* d_weights1d, int ksize,
+                                    int width, int height, cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
 // Stage 3: Sobel edge detection -- naive variant
 //
 // 3x3 horizontal and vertical gradients, combined as the true magnitude

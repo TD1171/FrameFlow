@@ -3,8 +3,24 @@
 #include <opencv2/core.hpp>
 
 #include <cstdint>
+#include <string>
 
 namespace frameflow {
+
+// Kernel implementation selected at runtime by --kernel. The progression is the
+// point of the project: each variant computes the same result by a different
+// memory strategy, so their timings are directly comparable.
+enum class Variant {
+    Naive,      // direct 2D convolution, every tap from global memory
+    Separable,  // two 1D passes: 2K taps instead of K*K
+    Shared,     // separable + shared-memory tiling with halo regions
+};
+
+const char* variant_name(Variant v);
+const char* variant_description(Variant v);
+
+// Returns false if `s` is not a known variant name.
+bool parse_variant(const std::string& s, Variant& out);
 
 // Accessors for the per-launch synchronization mode. Host translation units use
 // these rather than touching the flag directly, so that main.cpp does not have
@@ -42,7 +58,7 @@ class GpuPipeline {
 public:
     // ksize must be positive and odd. sigma <= 0 selects OpenCV's default
     // sigma-from-ksize rule so the two implementations still agree.
-    GpuPipeline(int width, int height, int ksize, double sigma);
+    GpuPipeline(int width, int height, int ksize, double sigma, Variant variant);
     ~GpuPipeline();
 
     GpuPipeline(const GpuPipeline&) = delete;
@@ -62,6 +78,7 @@ public:
     int height() const { return height_; }
     int ksize() const { return ksize_; }
     double sigma() const { return sigma_; }
+    Variant variant() const { return variant_; }
 
 private:
     void free_all() noexcept;
@@ -70,12 +87,15 @@ private:
     int height_ = 0;
     int ksize_ = 5;
     double sigma_ = 1.4;
+    Variant variant_ = Variant::Naive;
 
     uint8_t* d_bgr_ = nullptr;    // width*height*3
     uint8_t* d_gray_ = nullptr;   // width*height
     uint8_t* d_blur_ = nullptr;   // width*height
     uint8_t* d_edges_ = nullptr;  // width*height
-    float* d_weights2d_ = nullptr;// ksize*ksize
+    float* d_tmp_ = nullptr;      // width*height, separable intermediate
+    float* d_weights2d_ = nullptr;// ksize*ksize, naive
+    float* d_weights1d_ = nullptr;// ksize, separable and shared
 
     // Reused across frames; creating events per frame is a measurable cost.
     void* ev_[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};

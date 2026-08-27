@@ -19,6 +19,34 @@ enum EventSlot { kStart = 0, kAfterUpload, kAfterGray, kAfterBlur, kAfterSobel, 
 void set_debug_sync(bool enabled) { g_debug_sync = enabled; }
 bool debug_sync() { return g_debug_sync; }
 
+const char* variant_name(Variant v) {
+    switch (v) {
+        case Variant::Naive: return "naive";
+        case Variant::Separable: return "separable";
+        case Variant::Shared: return "shared";
+    }
+    return "unknown";
+}
+
+const char* variant_description(Variant v) {
+    switch (v) {
+        case Variant::Naive:
+            return "direct 2D convolution, all taps from global memory";
+        case Variant::Separable:
+            return "two 1D passes, 2K taps instead of K*K";
+        case Variant::Shared:
+            return "separable + shared-memory tiling with halo regions";
+    }
+    return "unknown";
+}
+
+bool parse_variant(const std::string& s, Variant& out) {
+    if (s == "naive") { out = Variant::Naive; return true; }
+    if (s == "separable") { out = Variant::Separable; return true; }
+    if (s == "shared") { out = Variant::Shared; return true; }
+    return false;
+}
+
 void FrameTimings::accumulate(const FrameTimings& t) {
     upload_ms += t.upload_ms;
     gray_ms += t.gray_ms;
@@ -47,16 +75,25 @@ void GpuPipeline::free_all() noexcept {
     if (d_gray_) { cudaFree(d_gray_); d_gray_ = nullptr; }
     if (d_blur_) { cudaFree(d_blur_); d_blur_ = nullptr; }
     if (d_edges_) { cudaFree(d_edges_); d_edges_ = nullptr; }
+    if (d_tmp_) { cudaFree(d_tmp_); d_tmp_ = nullptr; }
     if (d_weights2d_) { cudaFree(d_weights2d_); d_weights2d_ = nullptr; }
+    if (d_weights1d_) { cudaFree(d_weights1d_); d_weights1d_ = nullptr; }
     for (auto& e : ev_) {
         if (e) { cudaEventDestroy(ev(e)); e = nullptr; }
     }
 }
 
-GpuPipeline::GpuPipeline(int width, int height, int ksize, double sigma)
-    : width_(width), height_(height), ksize_(ksize), sigma_(sigma) {
+GpuPipeline::GpuPipeline(int width, int height, int ksize, double sigma, Variant variant)
+    : width_(width), height_(height), ksize_(ksize), sigma_(sigma), variant_(variant) {
     if (width <= 0 || height <= 0) {
         throw std::runtime_error("GpuPipeline requires a positive frame size");
+    }
+    if (variant == Variant::Shared) {
+        // Rejected explicitly rather than silently falling back to separable:
+        // a variant that quietly runs different code than the name says would
+        // corrupt every benchmark comparison that used it.
+        throw std::runtime_error("kernel variant 'shared' is not implemented yet; "
+                                 "use 'naive' or 'separable'");
     }
     if (ksize <= 0 || ksize % 2 == 0) {
         throw std::runtime_error("--ksize must be positive and odd, got " +
@@ -77,9 +114,18 @@ GpuPipeline::GpuPipeline(int width, int height, int ksize, double sigma)
         CUDA_CHECK(cudaMalloc(&d_blur_, pixels));
         CUDA_CHECK(cudaMalloc(&d_edges_, pixels));
 
+        // The separable intermediate is float rather than uint8 so the two
+        // 1D passes do not quantize twice. See kernels.cuh for the trade-off.
+        CUDA_CHECK(cudaMalloc(&d_tmp_, pixels * sizeof(float)));
+
         const std::vector<float> w2 = gaussian_kernel_2d(ksize, sigma);
         CUDA_CHECK(cudaMalloc(&d_weights2d_, w2.size() * sizeof(float)));
         CUDA_CHECK(cudaMemcpy(d_weights2d_, w2.data(), w2.size() * sizeof(float),
+                              cudaMemcpyHostToDevice));
+
+        const std::vector<float> w1 = gaussian_kernel_1d(ksize, sigma);
+        CUDA_CHECK(cudaMalloc(&d_weights1d_, w1.size() * sizeof(float)));
+        CUDA_CHECK(cudaMemcpy(d_weights1d_, w1.data(), w1.size() * sizeof(float),
                               cudaMemcpyHostToDevice));
 
         for (auto& slot : ev_) {
@@ -124,8 +170,19 @@ void GpuPipeline::process(const cv::Mat& bgr, cv::Mat& out, FrameTimings& timing
     launch_bgr_to_grayscale(d_bgr_, d_gray_, width_, height_, /*stream=*/0);
     CUDA_CHECK(cudaEventRecord(ev(ev_[kAfterGray])));
 
-    launch_gaussian_blur_naive(d_gray_, d_blur_, d_weights2d_, ksize_,
-                               width_, height_, /*stream=*/0);
+    switch (variant_) {
+        case Variant::Naive:
+            launch_gaussian_blur_naive(d_gray_, d_blur_, d_weights2d_, ksize_,
+                                       width_, height_, /*stream=*/0);
+            break;
+        case Variant::Separable:
+            launch_gaussian_blur_separable(d_gray_, d_tmp_, d_blur_, d_weights1d_,
+                                           ksize_, width_, height_, /*stream=*/0);
+            break;
+        case Variant::Shared:
+            // Unreachable: rejected in the constructor.
+            break;
+    }
     CUDA_CHECK(cudaEventRecord(ev(ev_[kAfterBlur])));
 
     launch_sobel_naive(d_blur_, d_edges_, width_, height_, /*stream=*/0);

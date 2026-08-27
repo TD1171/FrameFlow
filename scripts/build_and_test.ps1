@@ -114,6 +114,42 @@ foreach ($res in @(@{w=320; h=240; tag="aligned 320x240"},
     }
 }
 
+# Every implemented variant must produce the same image. This is the check that
+# catches halo bugs in the tiled kernels: those corrupt only tile borders, which
+# is a small enough fraction of the image to hide inside a whole-image mean
+# while being badly wrong where it happens. compare_variants.py fails on any
+# single pixel over tolerance, not on the average.
+#
+# Add new variants to this list as they are implemented; a variant that is not
+# listed here is not covered by the equivalence guarantee.
+$variants = @("naive", "separable")
+$variantClip = Join-Path $scratch "variant_clip.mp4"
+$variantPngs = @()
+
+Step "generate clip (variant comparison)" {
+    python (Join-Path $repo "scripts\generate_test_video.py") `
+        --output $variantClip --width 640 --height 480 --frames 4 --fps 30 | Out-Null
+    if (-not (Test-Path $variantClip)) { throw "generator produced no file" }
+}
+
+foreach ($v in $variants) {
+    Step "variant '$v' runs" {
+        & $exe --input $variantClip --frames 1 --warmup 2 --kernel $v --save-frames | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "frameflow --kernel $v exited $LASTEXITCODE" }
+        $srcPng = Join-Path $repo "results\stage3_edges.png"
+        if (-not (Test-Path $srcPng)) { throw "no edge PNG produced" }
+        $dstPng = Join-Path $scratch "$v.png"
+        Copy-Item $srcPng $dstPng -Force
+        $script:variantPngs += $dstPng
+    }
+}
+
+Step "all variants agree" {
+    if ($variantPngs.Count -lt 2) { throw "fewer than two variant images to compare" }
+    python (Join-Path $repo "scripts\compare_variants.py") @variantPngs --tol 1
+    if ($LASTEXITCODE -ne 0) { throw "variants disagree" }
+}
+
 # Negative cases. Each asserts the binary REJECTED its input. The positive cases
 # above (which assert exit 0 and correct pixels) are the control proving these
 # are not passing merely because the binary is broken.

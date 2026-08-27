@@ -177,6 +177,54 @@ __global__ void gaussianBlurNaive(const uint8_t* __restrict__ src,
 }
 
 // ---------------------------------------------------------------------------
+// Separable blur, horizontal pass: uint8 in, float out.
+//
+// Only the x index is reflected; y is a straight row index, so each thread
+// reads ksize consecutive-ish bytes along its own row. Consecutive threads in a
+// warp still read consecutive addresses, so the access stays coalesced.
+// ---------------------------------------------------------------------------
+__global__ void gaussianBlurHorizontal(const uint8_t* __restrict__ src,
+                                       float* __restrict__ dst,
+                                       const float* __restrict__ w,
+                                       int ksize, int width, int height) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+
+    const int radius = ksize / 2;
+    const int row = y * width;
+    float acc = 0.0f;
+    for (int k = -radius; k <= radius; ++k) {
+        acc += w[k + radius] * static_cast<float>(src[row + reflect101(x + k, width)]);
+    }
+    dst[row + x] = acc;  // kept in float; see the note in kernels.cuh
+}
+
+// ---------------------------------------------------------------------------
+// Separable blur, vertical pass: float in, uint8 out.
+//
+// This pass strides by `width` floats between taps, so a warp's ksize loads
+// touch ksize different rows. Each individual load is still coalesced across
+// the warp (consecutive threads read consecutive columns of the same row),
+// which is why x must remain the fastest-varying thread index here too.
+// ---------------------------------------------------------------------------
+__global__ void gaussianBlurVertical(const float* __restrict__ src,
+                                     uint8_t* __restrict__ dst,
+                                     const float* __restrict__ w,
+                                     int ksize, int width, int height) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+
+    const int radius = ksize / 2;
+    float acc = 0.0f;
+    for (int k = -radius; k <= radius; ++k) {
+        acc += w[k + radius] * src[reflect101(y + k, height) * width + x];
+    }
+    dst[y * width + x] = to_u8(acc);
+}
+
+// ---------------------------------------------------------------------------
 // Sobel edge detection, naive variant.
 //
 // Standard 3x3 operators. Sign convention matches cv::Sobel, so gx is positive
@@ -249,6 +297,24 @@ void launch_gaussian_blur_naive(const uint8_t* d_src, uint8_t* d_dst,
     gaussianBlurNaive<<<grid_for(width, height), dim3(kBlockX, kBlockY), 0, stream>>>(
         d_src, d_dst, d_weights2d, ksize, width, height);
     CUDA_CHECK_KERNEL("gaussianBlurNaive");
+}
+
+void launch_gaussian_blur_separable(const uint8_t* d_src, float* d_tmp, uint8_t* d_dst,
+                                    const float* d_weights1d, int ksize,
+                                    int width, int height, cudaStream_t stream) {
+    const dim3 grid = grid_for(width, height);
+    const dim3 block(kBlockX, kBlockY);
+
+    gaussianBlurHorizontal<<<grid, block, 0, stream>>>(d_src, d_tmp, d_weights1d,
+                                                       ksize, width, height);
+    CUDA_CHECK_KERNEL("gaussianBlurHorizontal");
+
+    // The vertical pass reads what the horizontal pass wrote. Both are issued
+    // into the same stream, and work in a stream executes in order, so no
+    // explicit synchronization is needed between them.
+    gaussianBlurVertical<<<grid, block, 0, stream>>>(d_tmp, d_dst, d_weights1d,
+                                                     ksize, width, height);
+    CUDA_CHECK_KERNEL("gaussianBlurVertical");
 }
 
 void launch_sobel_naive(const uint8_t* d_src, uint8_t* d_dst,

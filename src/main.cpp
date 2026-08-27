@@ -22,6 +22,9 @@ struct Options {
     int ksize = 5;
     double sigma = 1.4;
     int warmup = 30;
+    // Default is naive until the shared variant lands, so the default path
+    // is always one that actually exists.
+    frameflow::Variant variant = frameflow::Variant::Naive;
     bool save_frames = false;
     bool debug_sync = false;
     bool validate = false;
@@ -91,6 +94,13 @@ bool parse_args(int argc, char** argv, Options& opt, std::string& err) {
             if (!value_for("--input", opt.input)) return false;
         } else if (arg == "--output") {
             if (!value_for("--output", opt.output)) return false;
+        } else if (arg == "--kernel") {
+            std::string v;
+            if (!value_for("--kernel", v)) return false;
+            if (!frameflow::parse_variant(v, opt.variant)) {
+                err = "--kernel expects naive, separable or shared; got '" + v + "'";
+                return false;
+            }
         } else if (arg == "--save-frames") {
             opt.save_frames = true;
         } else if (arg == "--validate") {
@@ -168,7 +178,8 @@ void print_header(const frameflow::VideoInfo& info, const Options& opt) {
     std::printf("Stage 2: Gaussian Blur (%dx%d, sigma=%.2f)\n", opt.ksize, opt.ksize,
                 opt.sigma);
     std::printf("Stage 3: Sobel Edge Detection\n");
-    std::printf("Kernel variant: naive (direct 2D convolution, global memory)\n");
+    std::printf("Kernel variant: %s (%s)\n", frameflow::variant_name(opt.variant),
+                frameflow::variant_description(opt.variant));
     std::printf("Border mode: BORDER_REFLECT_101 (matches OpenCV default)\n");
     std::printf("Sync mode: %s\n",
                 frameflow::debug_sync() ? "per-launch synchronize (debug)"
@@ -198,7 +209,8 @@ int run_validate(const Options& opt) {
     frameflow::set_debug_sync(true);
     print_header(info, opt);
 
-    frameflow::GpuPipeline pipeline(info.width, info.height, opt.ksize, opt.sigma);
+    frameflow::GpuPipeline pipeline(info.width, info.height, opt.ksize, opt.sigma,
+                                    opt.variant);
     frameflow::CpuBaseline cpu(opt.ksize, opt.sigma);
 
     const long long limit = opt.frames > 0 ? opt.frames : 20;
@@ -301,7 +313,8 @@ int main(int argc, char** argv) {
         const frameflow::VideoInfo& info = reader.info();
         print_header(info, opt);
 
-        frameflow::GpuPipeline pipeline(info.width, info.height, opt.ksize, opt.sigma);
+        frameflow::GpuPipeline pipeline(info.width, info.height, opt.ksize, opt.sigma,
+                                    opt.variant);
 
         std::unique_ptr<frameflow::VideoWriter> writer;
         if (!opt.output.empty()) {
