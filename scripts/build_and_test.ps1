@@ -101,7 +101,7 @@ foreach ($res in @(@{w=320; h=240; tag="aligned 320x240"},
     } -Essential
 
     Step "runs and writes output ($($res.tag))" {
-        & $exe --input $clip --output $out --frames 4 --warmup 2 --save-frames | Out-Null
+        & $exe --input $clip --output $out --frames 4 --warmup 2 --save-frames --frames-dir $scratch | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "frameflow exited $LASTEXITCODE" }
         if (-not (Test-Path $out)) { throw "no output video was written" }
     }
@@ -109,7 +109,7 @@ foreach ($res in @(@{w=320; h=240; tag="aligned 320x240"},
     # The check that actually reads pixels. Without it, a kernel writing all
     # zeros or swapping B and R passes every other check in this file.
     Step "stage output matches NumPy oracle ($($res.tag))" {
-        python (Join-Path $repo "scripts\verify_stages.py") --dir (Join-Path $repo "results")
+        python (Join-Path $repo "scripts\verify_stages.py") --dir $scratch
         if ($LASTEXITCODE -ne 0) { throw "stage verification failed" }
     }
 }
@@ -142,11 +142,11 @@ $variantBlurPngs = @()
 
 foreach ($v in $variants) {
     Step "variant '$v' runs" {
-        & $exe --input $variantClip --frames 1 --warmup 2 --kernel $v --save-frames | Out-Null
+        & $exe --input $variantClip --frames 1 --warmup 2 --kernel $v --save-frames --frames-dir $scratch | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "frameflow --kernel $v exited $LASTEXITCODE" }
         foreach ($stage in @(@{src="stage2_blurred.png"; dst="blur_$v.png"},
                              @{src="stage3_edges.png";  dst="edge_$v.png"})) {
-            $srcPng = Join-Path $repo "results\$($stage.src)"
+            $srcPng = Join-Path $scratch $stage.src
             if (-not (Test-Path $srcPng)) { throw "no $($stage.src) produced" }
             Copy-Item $srcPng (Join-Path $scratch $stage.dst) -Force
         }

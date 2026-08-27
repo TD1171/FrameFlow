@@ -1,3 +1,4 @@
+#include "benchmark.h"
 #include "cpu_baseline.h"
 #include "pipeline.h"
 #include "video_io.h"
@@ -11,7 +12,9 @@
 #include <cstdlib>
 #include <exception>
 #include <memory>
+#include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace {
 
@@ -26,8 +29,13 @@ struct Options {
     // is always one that actually exists.
     frameflow::Variant variant = frameflow::Variant::Naive;
     bool save_frames = false;
+    // Where --save-frames writes. Configurable so the test suite can dump
+    // into a scratch directory instead of overwriting the committed
+    // README sample frames in results/.
+    std::string frames_dir = "results";
     bool debug_sync = false;
     bool validate = false;
+    bool benchmark = false;
 };
 
 // GPU/CPU agreement threshold, on an 8-bit scale. Exact equality is not
@@ -49,14 +57,18 @@ void print_usage() {
         "  --input <path>    source video (required)\n"
         "  --output <path>   destination video; omit to skip encoding\n"
         "  --frames N        process only the first N frames\n"
+        "  --kernel V        blur variant: naive | separable | shared\n"
         "  --ksize N         Gaussian kernel size, odd (default 5)\n"
         "  --sigma S         Gaussian sigma (default 1.4)\n"
         "  --warmup N        untimed warmup iterations before measuring\n"
         "                    (default 30; clock speeds need this to settle)\n"
         "  --save-frames     write a lossless PNG of each pipeline stage for\n"
-        "                    the first processed frame, into results/\n"
+        "                    the first processed frame\n"
+        "  --frames-dir D    directory for --save-frames (default results)\n"
         "  --validate        run the OpenCV CPU baseline alongside, report\n"
         "                    per-stage error and CPU/GPU timings, then exit\n"
+        "  --benchmark       sweep every variant across resolutions, write\n"
+        "                    results/benchmarks.csv, then exit\n"
         "  --debug-sync      synchronize after every kernel launch (slower;\n"
         "                    attributes a fault to the launch that caused it)\n"
         "  --help            show this message\n");
@@ -103,8 +115,12 @@ bool parse_args(int argc, char** argv, Options& opt, std::string& err) {
             }
         } else if (arg == "--save-frames") {
             opt.save_frames = true;
+        } else if (arg == "--frames-dir") {
+            if (!value_for("--frames-dir", opt.frames_dir)) return false;
         } else if (arg == "--validate") {
             opt.validate = true;
+        } else if (arg == "--benchmark") {
+            opt.benchmark = true;
         } else if (arg == "--debug-sync") {
             opt.debug_sync = true;
         } else if (arg == "--ksize") {
@@ -307,6 +323,16 @@ int main(int argc, char** argv) {
     frameflow::set_debug_sync(opt.debug_sync);
 
     try {
+        if (opt.benchmark) {
+            frameflow::BenchmarkOptions b;
+            b.input = opt.input;
+            b.ksize = opt.ksize;
+            b.sigma = opt.sigma;
+            b.warmup = opt.warmup;
+            if (opt.frames > 0) b.frames = static_cast<int>(opt.frames);
+            return frameflow::run_benchmark(b);
+        }
+
         if (opt.validate) return run_validate(opt);
 
         frameflow::VideoReader reader(opt.input);
@@ -354,11 +380,23 @@ int main(int argc, char** argv) {
                 cv::Mat gray, blurred;
                 pipeline.download_grayscale(gray);
                 pipeline.download_blurred(blurred);
-                cv::imwrite("results/stage0_original.png", frame);
-                cv::imwrite("results/stage1_grayscale.png", gray);
-                cv::imwrite("results/stage2_blurred.png", blurred);
-                cv::imwrite("results/stage3_edges.png", result);
-                std::printf("\nSaved stage PNGs to results/\n");
+                const std::string dir = opt.frames_dir + "/";
+                // imwrite returns false rather than throwing when the directory
+                // does not exist. Silently writing nothing would let a test that
+                // depends on these files fail somewhere far less obvious.
+                const std::pair<const char*, const cv::Mat*> outputs[] = {
+                    {"stage0_original.png", &frame},
+                    {"stage1_grayscale.png", &gray},
+                    {"stage2_blurred.png", &blurred},
+                    {"stage3_edges.png", &result},
+                };
+                for (const auto& o : outputs) {
+                    if (!cv::imwrite(dir + o.first, *o.second)) {
+                        throw std::runtime_error("could not write " + dir + o.first +
+                                                 " (does the directory exist?)");
+                    }
+                }
+                std::printf("\nSaved stage PNGs to %s\n", opt.frames_dir.c_str());
             }
 
             if (writer) writer->write(result);

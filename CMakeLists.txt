@@ -43,6 +43,7 @@ add_executable(frameflow
   src/main.cpp
   src/video_io.cpp
   src/cpu_baseline.cpp
+  src/benchmark.cpp
   src/kernels.cu
   src/pipeline.cu
 )
