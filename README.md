@@ -4,11 +4,19 @@ A CUDA C++ video processing pipeline with hand-written grayscale, Gaussian blur 
 
 OpenCV is used only for video I/O and as the CPU baseline. Every operation on the GPU is a kernel written in this project.
 
-![Sobel edge output](results/stage3_edges.png)
+| Input | Sobel output |
+|---|---|
+| ![](results/demo_original.jpg) | ![](results/demo_edges.png) |
+
+<sub>Source photograph by Tabitha Mort, [CC0 1.0](https://commons.wikimedia.org/wiki/File:Long_Exposure_Photography_of_City_Buildings.jpg) (public domain), cropped to 1920×1080.</sub>
+
+Every stage, on the synthetic clip the repository generates for reproducible benchmarking and validation:
 
 | Original | Grayscale | Blurred | Edges |
 |---|---|---|---|
 | ![](results/stage0_original.png) | ![](results/stage1_grayscale.png) | ![](results/stage2_blurred.png) | ![](results/stage3_edges.png) |
+
+<sub>The test clip contains pure blue, green and red patches deliberately: under BT.601 they map to distinct greys, so a BGR/RGB channel swap becomes visible rather than plausible.</sub>
 
 ---
 
