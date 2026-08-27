@@ -48,10 +48,16 @@ if ($Clean -and (Test-Path $build)) {
     Remove-Item $build -Recurse -Force
 }
 
+$exe = Join-Path $build "frameflow.exe"
+
+# Delete the previous binary before building. Without this, a failed build
+# leaves the last successful frameflow.exe in place and every downstream check
+# happily passes against stale code -- the build reports failure while the
+# suite reports success, which is worse than either alone.
+if (Test-Path $exe) { Remove-Item $exe -Force }
+
 Step "configure" { InVcEnv "cmake -S . -B build -G `"NMake Makefiles`" -DCMAKE_BUILD_TYPE=Release" }
 Step "build"     { InVcEnv "cmake --build build" }
-
-$exe = Join-Path $build "frameflow.exe"
 
 Step "binary exists" {
     if (-not (Test-Path $exe)) { throw "frameflow.exe was not produced" }
@@ -81,23 +87,33 @@ Step "runs and writes output" {
 # raises a terminating PowerShell error, which would make a correctly-rejecting
 # binary look like a failed test. cmd reports only the process exit code, which
 # is the thing actually being asserted.
-function ExpectNonZero($argline, $what) {
+# Asserts the binary rejected its input. Two guards make this a real test
+# rather than a tautology:
+#
+#   1. The executable must exist. Without this, every rejection test passes
+#      trivially when the build failed -- cmd returns non-zero for a command it
+#      cannot find, which looks identical to a clean rejection.
+#   2. The exit code must be exactly 1 (EXIT_FAILURE). "Any non-zero" would
+#      also accept 9009 (command not found) and 0xC0000135-style crash codes,
+#      so a segfaulting binary would pass a test named "rejects bad input".
+function ExpectRejected($argline, $what) {
+    if (-not (Test-Path $exe)) { throw "cannot test rejection: $exe does not exist" }
     cmd /c "`"$exe`" $argline >nul 2>&1"
     $code = $LASTEXITCODE
-    if ($code -eq 0) { throw "expected non-zero exit $what, got 0" }
+    if ($code -ne 1) { throw "expected exit code 1 $what, got $code" }
     $global:LASTEXITCODE = 0
 }
 
 Step "rejects a missing input file" {
-    ExpectNonZero "--input data\definitely_not_here.mp4" "for a missing file"
+    ExpectRejected "--input data\definitely_not_here.mp4" "for a missing file"
 }
 
 Step "rejects an unknown flag" {
-    ExpectNonZero "--input `"$clip`" --not-a-real-flag" "for an unknown flag"
+    ExpectRejected "--input `"$clip`" --not-a-real-flag" "for an unknown flag"
 }
 
 Step "rejects a missing --input" {
-    ExpectNonZero "" "when --input is absent"
+    ExpectRejected "" "when --input is absent"
 }
 
 Remove-Item $clip, (Join-Path $repo "results\_bt_smoke_out.mp4") -ErrorAction SilentlyContinue

@@ -1,6 +1,8 @@
+#include "pipeline.h"
 #include "video_io.h"
 
 #include <opencv2/core.hpp>
+#include <opencv2/imgcodecs.hpp>
 
 #include <chrono>
 #include <cstdio>
@@ -15,6 +17,8 @@ struct Options {
     std::string input;
     std::string output;      // empty => skip encoding entirely
     long long frames = -1;   // -1 => process the whole file
+    bool debug_sync = false; // sync after every kernel launch
+    bool save_frames = false;// dump lossless PNGs of each stage
 };
 
 void print_usage() {
@@ -26,10 +30,11 @@ void print_usage() {
         "  --input <path>    source video (required)\n"
         "  --output <path>   destination video; omit to skip encoding\n"
         "  --frames N        process only the first N frames\n"
+        "  --debug-sync      synchronize after every kernel launch (slower;\n"
+        "                    attributes a fault to the launch that caused it)\n"
         "  --help            show this message\n");
 }
 
-// Returns false if the argument list is malformed; `err` explains why.
 bool parse_args(int argc, char** argv, Options& opt, std::string& err) {
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -50,6 +55,10 @@ bool parse_args(int argc, char** argv, Options& opt, std::string& err) {
             if (!value_for("--input", opt.input)) return false;
         } else if (arg == "--output") {
             if (!value_for("--output", opt.output)) return false;
+        } else if (arg == "--save-frames") {
+            opt.save_frames = true;
+        } else if (arg == "--debug-sync") {
+            opt.debug_sync = true;
         } else if (arg == "--frames") {
             std::string v;
             if (!value_for("--frames", v)) return false;
@@ -88,13 +97,21 @@ void print_header(const frameflow::VideoInfo& info, const Options& opt) {
         std::printf("Frames: (not reported by container)\n");
     }
     std::printf("FPS (source): %.1f\n", info.fps);
-    if (opt.frames > 0) {
-        std::printf("Frame limit: %lld\n", opt.frames);
-    }
+    if (opt.frames > 0) std::printf("Frame limit: %lld\n", opt.frames);
+
     std::printf("\nPipeline\n");
     std::printf("------------------------\n");
-    std::printf("Stage 0: passthrough (decode -> encode, no processing)\n");
-    std::printf("Output: %s\n", opt.output.empty() ? "(none, decode only)" : opt.output.c_str());
+    std::printf("Stage 1: BGR -> Grayscale\n");
+    std::printf("Sync mode: %s\n",
+                frameflow::debug_sync() ? "per-launch synchronize (debug)"
+                                        : "launch check only (benchmark)");
+    std::printf("Output: %s\n",
+                opt.output.empty() ? "(none, decode + process only)" : opt.output.c_str());
+}
+
+void print_fps_line(const char* label, double ms, const char* note) {
+    std::printf("%-25s %8.3f ms  (%7.1f fps)   %s\n", label, ms,
+                ms > 0.0 ? 1000.0 / ms : 0.0, note);
 }
 
 }  // namespace
@@ -107,11 +124,14 @@ int main(int argc, char** argv) {
         print_usage();
         return EXIT_FAILURE;
     }
+    frameflow::set_debug_sync(opt.debug_sync);
 
     try {
         frameflow::VideoReader reader(opt.input);
         const frameflow::VideoInfo& info = reader.info();
         print_header(info, opt);
+
+        frameflow::GpuPipeline pipeline(info.width, info.height);
 
         std::unique_ptr<frameflow::VideoWriter> writer;
         if (!opt.output.empty()) {
@@ -119,19 +139,37 @@ int main(int argc, char** argv) {
                 opt.output, info.width, info.height, info.fps);
         }
 
-        cv::Mat frame;
+        cv::Mat frame, result;
+        frameflow::FrameTimings total{}, one{};
         long long processed = 0;
+        bool warmed_up = false;
+
         const auto t0 = std::chrono::steady_clock::now();
 
         while (reader.read(frame)) {
-            if (writer) writer->write(frame);
+            // The first launch pays for context setup, module loading and JIT.
+            // Running one untimed frame keeps that out of the measurement.
+            if (!warmed_up) {
+                pipeline.process(frame, result, one);
+                warmed_up = true;
+            }
+
+            pipeline.process(frame, result, one);
+            total.accumulate(one);
+
+            if (opt.save_frames && processed == 0) {
+                cv::imwrite("results/stage0_original.png", frame);
+                cv::imwrite("results/stage1_grayscale.png", result);
+                std::printf("Saved stage PNGs to results/\n");
+            }
+
+            if (writer) writer->write(result);
             ++processed;
             if (opt.frames > 0 && processed >= opt.frames) break;
         }
 
         const auto t1 = std::chrono::steady_clock::now();
-        const double elapsed_ms =
-            std::chrono::duration<double, std::milli>(t1 - t0).count();
+        const double elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
         if (processed == 0) {
             std::fprintf(stderr, "\nerror: no frames were decoded from '%s'\n",
@@ -139,14 +177,18 @@ int main(int argc, char** argv) {
             return EXIT_FAILURE;
         }
 
-        const double per_frame_ms = elapsed_ms / static_cast<double>(processed);
-        std::printf("\nPerformance\n");
+        total.divide(static_cast<double>(processed));
+        const double end_to_end_ms = elapsed_ms / static_cast<double>(processed);
+
+        std::printf("\nPerformance  (per frame, mean over %lld frames)\n", processed);
         std::printf("------------------------\n");
-        std::printf("Frames processed:        %lld\n", processed);
-        std::printf("End-to-end per frame:    %.3f ms  (%.1f fps)   [decode%s]\n",
-                    per_frame_ms, 1000.0 / per_frame_ms,
-                    writer ? " + encode" : " only");
-        std::printf("Total wall time:         %.1f ms\n\n", elapsed_ms);
+        print_fps_line("Kernel time:", total.kernel_ms, "[compute only]");
+        print_fps_line("GPU total:", total.gpu_total_ms, "[includes H2D/D2H transfer]");
+        print_fps_line("End-to-end:", end_to_end_ms,
+                       writer ? "[includes decode + encode]" : "[includes decode]");
+        std::printf("%-25s %8.3f ms / %8.3f ms\n", "  H2D / D2H:", total.upload_ms,
+                    total.download_ms);
+        std::printf("%-25s %8.1f ms\n\n", "Total wall time:", elapsed_ms);
 
         if (writer) {
             std::printf("Wrote %lld frames to %s\n\n", writer->frames_written(),
