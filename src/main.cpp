@@ -25,9 +25,7 @@ struct Options {
     int ksize = 5;
     double sigma = 1.4;
     int warmup = 30;
-    // Default is naive until the shared variant lands, so the default path
-    // is always one that actually exists.
-    frameflow::Variant variant = frameflow::Variant::Naive;
+    frameflow::Variant variant = frameflow::Variant::Shared;
     bool save_frames = false;
     // Where --save-frames writes. Configurable so the test suite can dump
     // into a scratch directory instead of overwriting the committed
@@ -38,14 +36,9 @@ struct Options {
     bool benchmark = false;
 };
 
-// GPU/CPU agreement threshold, on an 8-bit scale. Exact equality is not
-// achievable and not the goal: OpenCV's cvtColor uses fixed-point coefficients
-// that differ slightly from the exact BT.601 constants, and float summation
-// order differs between the two implementations. A mean absolute error below
-// one level means the two agree to within rounding on essentially every pixel.
-//
-// This threshold is NOT to be relaxed to make a failing kernel pass. If a stage
-// exceeds it, the kernel is wrong.
+// GPU/OpenCV agreement tolerance, mean absolute error on an 8-bit scale.
+// Exact equality is not expected: OpenCV uses fixed-point coefficients and the
+// two implementations sum in different orders.
 constexpr double kValidationTolerance = 1.0;
 
 void print_usage() {

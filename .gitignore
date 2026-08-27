@@ -49,5 +49,5 @@ venv/
 *.nsys-rep
 *.qdrep
 
-# Working notes: chat-session memory, not a project deliverable
-docs/
+# Local notes
+.notes/

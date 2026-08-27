@@ -62,26 +62,14 @@ std::vector<float> gaussian_kernel_2d(int ksize, double sigma) {
     return w2;
 }
 
-// ---------------------------------------------------------------------------
-// Filter weights in __constant__ memory.
+// Filter weights in __constant__ memory. The tap index is uniform across a
+// warp, so every thread reads the same value at the same time, which is the
+// access pattern the constant broadcast cache is built for.
 //
-// This is the textbook case for constant memory. The weights are small,
-// read-only for the lifetime of a launch, and every thread in a warp reads the
-// SAME element at the same time (the loop index k is uniform across the warp).
-// Constant memory is backed by a dedicated per-SM cache that broadcasts one
-// value to all threads of a warp in a single transaction. Reading the same
-// value from global memory instead costs an L1 lookup per access and consumes
-// L1 capacity that the image data could use.
-//
-// Sized for the maximum supported kernel (31, enforced in GpuPipeline):
-//   1D: 31 floats  = 124 bytes
-//   2D: 31*31      = 3,844 bytes
-// against a 64 KB constant bank, so the reservation is not a constraint.
-//
-// __constant__ arrays are statically sized and file-scope by necessity: their
-// addresses must be known at compile time. That is why these are here rather
-// than being passed as parameters like the image buffers.
-// ---------------------------------------------------------------------------
+// Sized for the maximum supported kernel (31, enforced in GpuPipeline): 124
+// bytes for the 1D filter and 3,844 for the 2D, against a 64 KB bank.
+// __constant__ arrays must be statically sized at file scope, which is why
+// these are not passed as kernel parameters like the image buffers.
 namespace {
 constexpr int kMaxKsize = 31;
 }
@@ -105,25 +93,17 @@ constexpr float kWeightB = 0.114f;
 constexpr float kWeightG = 0.587f;
 constexpr float kWeightR = 0.299f;
 
-// ---------------------------------------------------------------------------
-// Border handling: BORDER_REFLECT_101
-//
-// Pixels at the image edge have no neighbours, and the choice made here must
-// match the CPU baseline or validation reports an error that has nothing to do
-// with kernel correctness. OpenCV's convolution default is BORDER_REFLECT_101,
-// which mirrors about the edge pixel WITHOUT repeating it:
+// BORDER_REFLECT_101, matching the OpenCV convolution default so validation is
+// not dominated by border disagreement. Mirrors about the edge pixel without
+// repeating it:
 //
 //     row:            a b c d e
 //     extended:   c b|a b c d e|d c
 //
-// so index -1 maps to 1 and index n maps to n-2. (Plain REFLECT would give
-// a b|a b c d e|e d -- repeating the edge sample. Getting this wrong shifts
-// every border pixel by one source sample.)
-//
-// The loop handles the case where a tap reaches past the mirrored range too,
-// which only occurs for images narrower than the filter. n == 1 is guarded
-// because it would otherwise spin forever.
-// ---------------------------------------------------------------------------
+// so index -1 maps to 1 and index n maps to n-2. Plain REFLECT repeats the edge
+// sample instead, shifting every border pixel by one. The loop covers taps
+// reaching past the mirrored range, which happens only when the image is
+// narrower than the filter; n == 1 would otherwise spin forever.
 __device__ __forceinline__ int reflect101(int i, int n) {
     if (n == 1) return 0;
     while (i < 0 || i >= n) {
@@ -139,28 +119,20 @@ __device__ __forceinline__ uint8_t to_u8(float v) {
     return static_cast<uint8_t>(fminf(fmaxf(rintf(v), 0.0f), 255.0f));
 }
 
-// ---------------------------------------------------------------------------
-// One thread per output pixel. Purely element-wise: no neighbour access, no
-// shared memory, nothing to synchronize. This is the warm-up kernel whose job
-// is to establish the indexing and bounds-checking pattern the convolution
-// kernels reuse.
+// One thread per output pixel, element-wise, no neighbour access.
 //
-// Thread mapping: x comes from threadIdx.x so consecutive threads in a warp
-// handle consecutive columns. Images are row-major, so those threads then touch
-// consecutive addresses and the warp's loads coalesce into a small number of
-// transactions. Mapping x to threadIdx.y instead would make each thread in a
-// warp stride a whole row apart, turning one coalesced access into 32 separate
-// ones.
-// ---------------------------------------------------------------------------
+// x comes from threadIdx.x so consecutive threads in a warp handle consecutive
+// columns. Images are row-major, so those accesses are contiguous and coalesce.
+// Mapping x to threadIdx.y would make each thread in a warp stride a full row
+// apart, splitting one coalesced access into 32.
 __global__ void bgrToGrayscale(const uint8_t* __restrict__ bgr,
                                uint8_t* __restrict__ gray,
                                int width, int height) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
 
-    // Grid dimensions are rounded up, so the last block in each dimension runs
-    // threads past the image edge. Without this guard they would read and write
-    // out of bounds -- the defect that hides behind power-of-two test images.
+    // Grid dimensions round up, so the last block in each dimension overhangs
+    // the image and those threads must not read or write.
     if (x >= width || y >= height) return;
 
     const int src = (y * width + x) * 3;
@@ -171,24 +143,12 @@ __global__ void bgrToGrayscale(const uint8_t* __restrict__ bgr,
     gray[y * width + x] = to_u8(kWeightB * b + kWeightG * g + kWeightR * r);
 }
 
-// ---------------------------------------------------------------------------
-// Gaussian blur, naive variant: direct 2D convolution from global memory.
+// Direct 2D convolution: every tap read from global memory.
 //
-// Memory traffic, worked out for the default 5x5 filter: each thread issues
-// ksize*ksize = 25 global loads to produce one output pixel. A 16x16 block
-// produces 256 outputs and therefore issues 256*25 = 6,400 global loads, even
-// though the distinct data it touches is only a 20x20 region = 400 pixels. The
-// same bytes cross the bus roughly 16x more often than strictly necessary.
-//
-// In practice the L1/L2 caches absorb much of that redundancy, which is exactly
-// why the measured speedup from tiling is smaller than 6400/400 would suggest.
-// The tiled variant in a later stage makes the reuse explicit instead of
-// hoping the cache catches it.
-//
-// Weights are read from global memory here on purpose. Moving them to
-// __constant__ memory is a separate optimization, measured separately, so its
-// contribution is not silently folded into the tiling result.
-// ---------------------------------------------------------------------------
+// Traffic for the default 5x5: 25 loads per output pixel. A 16x16 block issues
+// 256*25 = 6,400 loads while touching only a 20x20 = 400 pixel region, so the
+// same bytes are requested roughly 16x more than necessary. Measured gain from
+// tiling is far below 16x, which suggests caching already recovers much of it.
 __global__ void gaussianBlurNaive(const uint8_t* __restrict__ src,
                                   uint8_t* __restrict__ dst,
                                   int ksize, int width, int height) {
@@ -211,13 +171,8 @@ __global__ void gaussianBlurNaive(const uint8_t* __restrict__ src,
     dst[y * width + x] = to_u8(acc);
 }
 
-// ---------------------------------------------------------------------------
 // Separable blur, horizontal pass: uint8 in, float out.
-//
-// Only the x index is reflected; y is a straight row index, so each thread
-// reads ksize consecutive-ish bytes along its own row. Consecutive threads in a
-// warp still read consecutive addresses, so the access stays coalesced.
-// ---------------------------------------------------------------------------
+// Only x is reflected; y is a plain row index, so accesses stay coalesced.
 __global__ void gaussianBlurHorizontal(const uint8_t* __restrict__ src,
                                        float* __restrict__ dst,
                                        int ksize, int width, int height) {
@@ -234,14 +189,11 @@ __global__ void gaussianBlurHorizontal(const uint8_t* __restrict__ src,
     dst[row + x] = acc;  // kept in float; see the note in kernels.cuh
 }
 
-// ---------------------------------------------------------------------------
 // Separable blur, vertical pass: float in, uint8 out.
 //
-// This pass strides by `width` floats between taps, so a warp's ksize loads
-// touch ksize different rows. Each individual load is still coalesced across
-// the warp (consecutive threads read consecutive columns of the same row),
-// which is why x must remain the fastest-varying thread index here too.
-// ---------------------------------------------------------------------------
+// Taps stride a full row apart, so a warp's loads touch ksize different rows.
+// Each individual load is still coalesced because consecutive threads read
+// consecutive columns, which is why x stays the fastest-varying index here.
 __global__ void gaussianBlurVertical(const float* __restrict__ src,
                                      uint8_t* __restrict__ dst,
                                      int ksize, int width, int height) {
@@ -257,31 +209,18 @@ __global__ void gaussianBlurVertical(const float* __restrict__ src,
     dst[y * width + x] = to_u8(acc);
 }
 
-// ---------------------------------------------------------------------------
 // Separable blur, horizontal pass, shared-memory tiled.
+// Shared tile: [blockDim.y][blockDim.x + 2*radius]. Only x needs a halo here.
 //
-// Shared tile layout: [blockDim.y][blockDim.x + 2*radius], row-major.
-// Only x needs a halo in this pass; y is a plain row index.
+// HALO LOADING. A grid-stride loop over the tile width has each thread load one
+// interior pixel, with low-index threads looping again for the halo columns.
+// At blockDim.x = 16 and radius 2, tileW = 20: threads 0-15 load columns 0-15,
+// then threads 0-3 load 16-19. This needs no separate halo index arithmetic and
+// cannot leave a gap when the tile exceeds twice the block width.
 //
-// HALO LOADING STRATEGY. Each thread loads one interior pixel, and the threads
-// with low threadIdx.x additionally load the halo columns, via a grid-stride
-// loop over the tile width:
-//
-//     for (i = threadIdx.x; i < tileW; i += blockDim.x)
-//
-// With blockDim.x = 16 and radius 2, tileW = 20: threads 0..15 load columns
-// 0..15, then threads 0..3 loop again to load columns 16..19. So most threads
-// load once and four load twice. This is chosen over the common alternative
-// ("thread loads its own pixel, then threads 0..2R-1 load the halo") because
-// it needs no separate index arithmetic for the halo and cannot leave a gap if
-// the tile is more than twice the block width.
-//
-// The __syncthreads() below is mandatory: thread 15 reads columns 15..19, which
-// were written by other threads. Without the barrier it could read stale
-// shared memory. Note it sits OUTSIDE the y-bounds guard -- every thread in the
-// block must reach every __syncthreads(), and letting out-of-range threads
-// return early would deadlock the block.
-// ---------------------------------------------------------------------------
+// The __syncthreads() is mandatory: thread 15 reads columns written by other
+// threads. It sits OUTSIDE the bounds guard because every thread must reach
+// every barrier, so letting out-of-range threads return early would deadlock.
 __global__ void gaussianBlurHorizontalShared(const uint8_t* __restrict__ src,
                                              float* __restrict__ dst,
                                              int ksize, int width, int height) {
@@ -310,21 +249,13 @@ __global__ void gaussianBlurHorizontalShared(const uint8_t* __restrict__ src,
     dst[y * width + x] = acc;
 }
 
-// ---------------------------------------------------------------------------
 // Separable blur, vertical pass, shared-memory tiled.
+// Shared tile: [blockDim.y + 2*radius][blockDim.x]. Only y needs a halo.
 //
-// Shared tile layout: [blockDim.y + 2*radius][blockDim.x]. Only y needs a halo.
-//
-// This pass benefits more from tiling than the horizontal one does. In the
-// untiled vertical kernel each tap strides a full row (width floats) away, so
-// the ksize taps for one output pixel land in ksize different cache lines. In
-// the tiled version those rows are read once into shared memory and reused by
-// every thread in the column.
-//
-// Keeping x as the fastest-varying index matters here too: consecutive threads
-// read consecutive columns of the same row, so each global load is coalesced
+// Untiled, each tap strides a full row away, so one output pixel's taps land in
+// ksize different cache lines. Tiled, those rows are read once and reused by the
+// whole column. x stays the fastest-varying index so global loads still coalesce
 // even though the tile is tall rather than wide.
-// ---------------------------------------------------------------------------
 __global__ void gaussianBlurVerticalShared(const float* __restrict__ src,
                                            uint8_t* __restrict__ dst,
                                            int ksize, int width, int height) {
@@ -353,14 +284,10 @@ __global__ void gaussianBlurVerticalShared(const float* __restrict__ src,
     dst[y * width + x] = to_u8(acc);
 }
 
-// ---------------------------------------------------------------------------
-// Sobel, shared-memory tiled. Radius is fixed at 1, so the tile is
-// (blockDim.x + 2) x (blockDim.y + 2) -- 18x18 for a 16x16 block.
-//
-// Both dimensions need a halo here, so the load is a 2D grid-stride loop.
-// Every thread participates in loading regardless of whether its own output
-// pixel is inside the image, because the barrier requires the whole block.
-// ---------------------------------------------------------------------------
+// Sobel, shared-memory tiled. Radius 1, so an 18x18 tile for a 16x16 block.
+// Both dimensions need a halo, so the load is a 2D grid-stride loop. Every
+// thread participates regardless of whether its own output pixel is in bounds,
+// because the barrier requires the whole block.
 __global__ void sobelShared(const uint8_t* __restrict__ src,
                             uint8_t* __restrict__ dst,
                             int width, int height) {
@@ -402,27 +329,21 @@ __global__ void sobelShared(const uint8_t* __restrict__ src,
     dst[y * width + x] = to_u8(sqrtf(gx * gx + gy * gy));
 }
 
-// ---------------------------------------------------------------------------
-// Sobel edge detection, naive variant.
-//
-// Standard 3x3 operators. Sign convention matches cv::Sobel, so gx is positive
-// for a left-to-right increase in intensity:
+// Sobel edge detection, naive variant. Sign convention matches cv::Sobel, so
+// gx is positive for a left-to-right increase in intensity:
 //
 //     gx = [-1  0  1]        gy = [-1 -2 -1]
 //          [-2  0  2]             [ 0  0  0]
 //          [-1  0  1]             [ 1  2  1]
 //
-// The result is the true magnitude sqrt(gx^2 + gy^2), not the |gx| + |gy|
-// approximation. The approximation is cheaper but overestimates diagonal edges
-// by up to 41%, which would show up as a real disagreement against an OpenCV
-// baseline rather than as rounding.
+// Uses the true magnitude sqrt(gx^2 + gy^2) rather than the |gx| + |gy|
+// approximation, which overestimates diagonal edges by up to 41% and would
+// disagree with the OpenCV baseline by more than rounding.
 //
-// SATURATION: gx and gy each span [-1020, 1020] for 8-bit input, so the
-// magnitude can reach ~1443 while the output is 8-bit. Values above 255 are
-// clamped, not scaled. Strong edges therefore saturate to white and lose their
-// relative ordering. This is deliberate -- it matches what the CPU baseline
-// does when converting to CV_8U -- but it means the output is an edge map, not
-// a quantitative gradient field.
+// SATURATION: gx and gy span [-1020, 1020] for 8-bit input, so the magnitude
+// reaches ~1443 against an 8-bit output. Values above 255 are clamped, not
+// scaled, matching what the CPU baseline does converting to CV_8U. The result
+// is an edge map, not a quantitative gradient field.
 // ---------------------------------------------------------------------------
 __global__ void sobelNaive(const uint8_t* __restrict__ src,
                            uint8_t* __restrict__ dst,

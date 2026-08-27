@@ -7,9 +7,8 @@
 
 namespace frameflow {
 
-// Kernel implementation selected at runtime by --kernel. The progression is the
-// point of the project: each variant computes the same result by a different
-// memory strategy, so their timings are directly comparable.
+// Blur implementation selected by --kernel. Each variant computes the same
+// result by a different memory strategy, so timings are directly comparable.
 enum class Variant {
     Naive,      // direct 2D convolution, every tap from global memory
     Separable,  // two 1D passes: 2K taps instead of K*K
@@ -29,15 +28,13 @@ bool parse_variant(const std::string& s, Variant& out);
 void set_debug_sync(bool enabled);
 bool debug_sync();
 
-// Per-frame GPU timings in milliseconds, measured with cudaEvent records.
-// Host clocks are not used for GPU work: kernel launches are asynchronous, so a
-// host timer around a launch measures the launch call, not the kernel.
+// Per-frame GPU timings in milliseconds, from cudaEvent records. A host timer
+// around an asynchronous launch would measure the launch call, not the kernel.
 //
-// CAVEAT on kernel_ms: the uploads and downloads here are synchronous copies
-// from pageable host memory, so the GPU is idle at the moment the post-upload
-// event is recorded. kernel_ms therefore includes the host-side launch latency
-// of the first kernel in the chain, and is a slight OVER-estimate of pure
-// compute. Pinned memory plus async copies would remove this; that is Tier 3.
+// CAVEAT: uploads and downloads are synchronous copies from pageable memory, so
+// the GPU is idle when the post-upload event is recorded. kernel_ms therefore
+// includes the first kernel's launch latency and slightly over-estimates pure
+// compute.
 struct FrameTimings {
     float upload_ms = 0.0f;
     float gray_ms = 0.0f;

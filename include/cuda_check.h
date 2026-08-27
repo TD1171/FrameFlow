@@ -7,25 +7,16 @@
 
 namespace frameflow {
 
-// Controls whether a device synchronize follows every kernel launch.
+// Whether a device synchronize follows every kernel launch.
 //
-// There are two distinct needs here and conflating them produces either
-// unattributable crashes or dishonest benchmarks:
+// Launches are asynchronous, so without a sync an error surfaces at whatever
+// unrelated API call happens to synchronize next. Debugging wants the sync;
+// benchmarking does not, since it serializes the pipeline and folds per-launch
+// latency into the measurement. Timing instead uses cudaEvent records with one
+// synchronize at the end of the measured region.
 //
-//   Debug / validation -- sync after every launch so a fault is reported at the
-//   launch that caused it rather than at some later, unrelated API call. Kernel
-//   launches are asynchronous, so without this the error surfaces wherever the
-//   host next happens to synchronize.
-//
-//   Benchmark -- check the launch for configuration errors (this is a host-side
-//   check and costs nothing) but do NOT force a sync. A cudaDeviceSynchronize()
-//   after every launch serializes the pipeline, folds per-launch latency into
-//   the measurement, and would defeat any later stream overlap. Timing comes
-//   from cudaEvent records bracketing the measured region, with exactly one
-//   synchronize at the end of it.
-//
-// Defaults to true in Debug builds (FRAMEFLOW_DEBUG_SYNC) and is forced true at
-// runtime by --validate. The README states which mode published numbers used.
+// Defaults true in Debug builds (FRAMEFLOW_DEBUG_SYNC), and --validate forces
+// it on at runtime.
 extern bool g_debug_sync;
 
 inline void cuda_check(cudaError_t err, const char* expr, const char* file, int line) {
@@ -38,8 +29,7 @@ inline void cuda_check(cudaError_t err, const char* expr, const char* file, int 
 
 // Checks a kernel launch. Always cheap; synchronizes only when g_debug_sync.
 inline void cuda_check_kernel(const char* name, const char* file, int line) {
-    // Catches launch-configuration faults (bad grid/block, too much shared
-    // memory). Host-side and essentially free -- always worth doing.
+    // Catches launch-configuration faults. Host-side and essentially free.
     cuda_check(cudaGetLastError(), name, file, line);
     if (g_debug_sync) {
         cuda_check(cudaDeviceSynchronize(), "cudaDeviceSynchronize", file, line);
