@@ -33,10 +33,9 @@ std::vector<float> gaussian_kernel_1d(int ksize, double sigma) {
     const double centre = (ksize - 1) * 0.5;
     const double scale = -0.5 / (sigma * sigma);
 
-    // Accumulate in double, then normalize. Normalizing by the actual sum
-    // rather than the analytic 1/(sigma*sqrt(2pi)) matters: the kernel is
-    // truncated at ksize taps, so the analytic constant would not sum to 1 and
-    // would darken or brighten the whole image.
+    // Normalise by the actual sum, not the analytic constant: the kernel is
+    // truncated at ksize taps, so the analytic value would not sum to 1 and
+    // would shift overall image brightness.
     double sum = 0.0;
     for (int i = 0; i < ksize; ++i) {
         const double x = i - centre;
@@ -62,14 +61,11 @@ std::vector<float> gaussian_kernel_2d(int ksize, double sigma) {
     return w2;
 }
 
-// Filter weights in __constant__ memory. The tap index is uniform across a
-// warp, so every thread reads the same value at the same time, which is the
-// access pattern the constant broadcast cache is built for.
+// Gaussian weights are small, read-only, and read uniformly across each warp,
+// which suits constant memory. Sized for the maximum ksize of 31.
 //
-// Sized for the maximum supported kernel (31, enforced in GpuPipeline): 124
-// bytes for the 1D filter and 3,844 for the 2D, against a 64 KB bank.
 // __constant__ arrays must be statically sized at file scope, which is why
-// these are not passed as kernel parameters like the image buffers.
+// these are not kernel parameters like the image buffers.
 namespace {
 constexpr int kMaxKsize = 31;
 }
@@ -119,12 +115,9 @@ __device__ __forceinline__ uint8_t to_u8(float v) {
     return static_cast<uint8_t>(fminf(fmaxf(rintf(v), 0.0f), 255.0f));
 }
 
-// One thread per output pixel, element-wise, no neighbour access.
-//
-// x comes from threadIdx.x so consecutive threads in a warp handle consecutive
-// columns. Images are row-major, so those accesses are contiguous and coalesce.
-// Mapping x to threadIdx.y would make each thread in a warp stride a full row
-// apart, splitting one coalesced access into 32.
+// One thread per output pixel. x maps to threadIdx.x so adjacent threads read
+// adjacent BGR pixels; with row-major storage that keeps the access coalesced.
+// Mapping x to threadIdx.y would stride a full row per thread instead.
 __global__ void bgrToGrayscale(const uint8_t* __restrict__ bgr,
                                uint8_t* __restrict__ gray,
                                int width, int height) {
@@ -143,12 +136,9 @@ __global__ void bgrToGrayscale(const uint8_t* __restrict__ bgr,
     gray[y * width + x] = to_u8(kWeightB * b + kWeightG * g + kWeightR * r);
 }
 
-// Direct 2D convolution: every tap read from global memory.
-//
-// Traffic for the default 5x5: 25 loads per output pixel. A 16x16 block issues
-// 256*25 = 6,400 loads while touching only a 20x20 = 400 pixel region, so the
-// same bytes are requested roughly 16x more than necessary. Measured gain from
-// tiling is far below 16x, which suggests caching already recovers much of it.
+// Direct 2D convolution: every tap from global memory, 25 loads per output
+// pixel at 5x5, with heavy overlap between neighbouring threads.
+// Traffic analysis in docs/OPTIMIZATION.md.
 __global__ void gaussianBlurNaive(const uint8_t* __restrict__ src,
                                   uint8_t* __restrict__ dst,
                                   int ksize, int width, int height) {
@@ -252,10 +242,8 @@ __global__ void gaussianBlurHorizontalShared(const uint8_t* __restrict__ src,
 // Separable blur, vertical pass, shared-memory tiled.
 // Shared tile: [blockDim.y + 2*radius][blockDim.x]. Only y needs a halo.
 //
-// Untiled, each tap strides a full row away, so one output pixel's taps land in
-// ksize different cache lines. Tiled, those rows are read once and reused by the
-// whole column. x stays the fastest-varying index so global loads still coalesce
-// even though the tile is tall rather than wide.
+// x stays the fastest-varying index so global loads coalesce even though the
+// tile is tall rather than wide.
 __global__ void gaussianBlurVerticalShared(const float* __restrict__ src,
                                            uint8_t* __restrict__ dst,
                                            int ksize, int width, int height) {
@@ -340,10 +328,9 @@ __global__ void sobelShared(const uint8_t* __restrict__ src,
 // approximation, which overestimates diagonal edges by up to 41% and would
 // disagree with the OpenCV baseline by more than rounding.
 //
-// SATURATION: gx and gy span [-1020, 1020] for 8-bit input, so the magnitude
-// reaches ~1443 against an 8-bit output. Values above 255 are clamped, not
-// scaled, matching what the CPU baseline does converting to CV_8U. The result
-// is an edge map, not a quantitative gradient field.
+// SATURATION: the magnitude reaches ~1443 for 8-bit input against an 8-bit
+// output. Values above 255 are clamped, not scaled, matching what the CPU
+// baseline does. The result is an edge map, not a gradient field.
 // ---------------------------------------------------------------------------
 __global__ void sobelNaive(const uint8_t* __restrict__ src,
                            uint8_t* __restrict__ dst,
@@ -371,8 +358,8 @@ __global__ void sobelNaive(const uint8_t* __restrict__ src,
     dst[y * width + x] = to_u8(sqrtf(gx * gx + gy * gy));
 }
 
-// 16x16 = 256 threads: a multiple of the 32-thread warp size, and small enough
-// to keep several blocks resident per SM for latency hiding.
+// 16x16 = 256 threads: a multiple of the warp size, small enough to keep
+// several blocks resident per SM.
 constexpr int kBlockX = 16;
 constexpr int kBlockY = 16;
 

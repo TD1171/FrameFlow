@@ -14,9 +14,9 @@ OpenCV is used only for video I/O and as the CPU baseline. Every operation on th
 
 ## Performance
 
-Measured on an RTX 5060 Laptop GPU (Blackwell, `sm_120`), CUDA 12.8, Release build, 1920×1080.
+RTX 5060 Laptop GPU (Blackwell, `sm_120`), CUDA 12.8, Release build, 1920×1080.
 
-**Gaussian blur, the stage the optimizations target:**
+**Gaussian blur — the stage the optimizations target.** From the benchmark sweep:
 
 | variant | ms/frame | vs naive |
 |---|---|---|
@@ -24,20 +24,29 @@ Measured on an RTX 5060 Laptop GPU (Blackwell, `sm_120`), CUDA 12.8, Release bui
 | separable — two 1D passes | 0.106 | 1.72× |
 | shared — tiled with halo regions | **0.092** | **1.98×** |
 
-**Whole pipeline:**
+![Blur speedup vs naive](results/bench_speedup_vs_naive.png)
+
+**Processing time, all three stages.** Benchmark sweep: median of per-frame samples over repeated passes on in-memory frames, with no video decode in the loop.
+
+| | ms/frame |
+|---|---|
+| OpenCV CPU baseline (multithreaded SIMD) | 5.686 |
+| CUDA kernels, compute only | **0.240** |
+| CUDA + PCIe transfer both ways | 0.935 |
+
+**End-to-end video throughput.** A separate run over the full 1080p clip, mean across 200 frames, including CPU decode and encode.
 
 | | ms/frame | rate |
 |---|---|---|
-| Kernel time (compute only) | 0.319 | 3,134 fps |
-| GPU total (+ PCIe transfer) | 1.170 | 855 fps |
-| End-to-end (+ decode and encode) | 9.867 | **101 fps** |
-| CPU baseline (OpenCV, multithreaded SIMD) | 5.686 | 176 fps |
+| Kernels | 0.319 | |
+| + PCIe transfer | 1.170 | |
+| **+ decode and encode** | **9.867** | **101 fps** |
 
-![Blur speedup vs naive](results/bench_speedup_vs_naive.png)
+The kernel figure differs between the two tables (0.240 vs 0.319 ms) because they are different measurements: the sweep takes a median over repeated passes on cached frames, while the end-to-end run takes a mean with video decode interleaved between frames. Both are real; neither corrects the other.
 
-**On "real-time":** the source clip is 30 fps and end-to-end throughput is 101 fps at 1080p, so the pipeline runs at about 3.4× real-time including CPU decode and encode. The 3,134 fps figure is GPU processing throughput, not pipeline throughput — the two are 10× apart and are not interchangeable. 4K end-to-end was not measured; the 4K numbers in `results/benchmarks.csv` are compute-only, from resized frames.
+**On "real-time":** the source is 30 fps and end-to-end throughput is 101 fps, so the pipeline runs at roughly 3.4× real-time including decode and encode. Kernel-only throughput is about 10× higher and describes GPU processing, not pipeline throughput. 4K end-to-end was not measured — the 4K rows in the CSV are compute-only, on resized frames.
 
-Full sweep: 3 variants × 4 resolutions in [results/benchmarks.csv](results/benchmarks.csv), with plots in `results/`.
+Full sweep, 3 variants × 4 resolutions: [results/benchmarks.csv](results/benchmarks.csv), plots in `results/`.
 
 ---
 
@@ -132,7 +141,7 @@ python scripts/plot_benchmarks.py
 
 | Flag | |
 |---|---|
-| `--input <path>` | source video or image (required) |
+| `--input <path>` | source video, required. A single image also works — OpenCV's `VideoCapture` opens one as a one-frame sequence |
 | `--output <path>` | destination video; omit to skip encoding |
 | `--kernel {naive,separable,shared}` | blur variant, default `shared` |
 | `--frames N` | process only the first N frames |
