@@ -19,7 +19,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 # OpenCV is used for video I/O, PNG output and the CPU baseline only. Every
-# device-side operation is a hand-written kernel.
+# device-side operation is a custom kernel.
 if(WIN32 AND NOT DEFINED OpenCV_DIR AND EXISTS "C:/opencv/build")
   set(OpenCV_DIR "C:/opencv/build")
 endif()

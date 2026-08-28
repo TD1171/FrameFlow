@@ -1,8 +1,8 @@
 # FrameFlow
 
-A CUDA C++ video processing pipeline with hand-written grayscale, Gaussian blur and Sobel kernels. I implemented the blur three ways — naive, separable, and shared-memory tiled — validated all of them against OpenCV, and benchmarked how each memory optimization affected performance.
+A CUDA C++ video processing pipeline with custom grayscale, Gaussian blur and Sobel kernels. I implemented the blur three ways — naive, separable, and shared-memory tiled — validated all of them against OpenCV, and benchmarked how each memory optimization affected performance.
 
-OpenCV is used only for video I/O and as the CPU baseline. Every operation on the GPU is a kernel written in this project.
+OpenCV is used only for video I/O and the CPU baseline; all GPU processing uses custom CUDA kernels.
 
 | Input | Sobel output |
 |---|---|
@@ -149,7 +149,7 @@ python scripts/plot_benchmarks.py
 
 | Flag | |
 |---|---|
-| `--input <path>` | source video, required. A single image also works — OpenCV's `VideoCapture` opens one as a one-frame sequence |
+| `--input <path>` | source video (required) |
 | `--output <path>` | destination video; omit to skip encoding |
 | `--kernel {naive,separable,shared}` | blur variant, default `shared` |
 | `--frames N` | process only the first N frames |
