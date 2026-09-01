@@ -60,4 +60,11 @@ struct StageError {
 
 StageError compare_u8(const cv::Mat& a, const cv::Mat& b);
 
+// Same, but ignoring `margin` pixels around the edge. Needed when the two
+// implementations use different border modes: NPP's filters accept only
+// REPLICATE while the custom kernels use REFLECT_101, so pixels within one
+// filter radius of the edge legitimately differ. `pixels` reports how many
+// were actually compared so the exclusion can be stated rather than hidden.
+StageError compare_u8_interior(const cv::Mat& a, const cv::Mat& b, int margin);
+
 }  // namespace frameflow

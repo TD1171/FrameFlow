@@ -26,6 +26,13 @@ endif()
 
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs videoio)
 
+# NPP ships with the CUDA Toolkit and provides the vendor-optimised GPU
+# baseline the custom kernels are measured against.
+#   nppicc  colour conversion (BGR -> grayscale)
+#   nppif   filtering (convolution, Sobel)
+#   nppisu  pitched allocation
+find_package(CUDAToolkit REQUIRED)
+
 add_executable(frameflow
   src/main.cpp
   src/video_io.cpp
@@ -33,6 +40,7 @@ add_executable(frameflow
   src/benchmark.cpp
   src/kernels.cu
   src/pipeline.cu
+  src/gpu_baseline.cu
 )
 
 target_include_directories(frameflow PRIVATE
@@ -40,7 +48,10 @@ target_include_directories(frameflow PRIVATE
   ${OpenCV_INCLUDE_DIRS}
 )
 
-target_link_libraries(frameflow PRIVATE ${OpenCV_LIBS})
+target_link_libraries(frameflow PRIVATE
+  ${OpenCV_LIBS}
+  CUDA::nppc CUDA::nppicc CUDA::nppif CUDA::nppisu
+)
 
 # CUDA_SEPARABLE_COMPILATION stays off: no .cu file calls a __device__ function
 # defined in another, so relocatable device code buys nothing here.

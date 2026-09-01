@@ -28,31 +28,25 @@ RTX 5060 Laptop GPU (Blackwell, `sm_120`), CUDA 12.8, Release build, 1920×1080.
 
 | variant | ms/frame | vs naive |
 |---|---|---|
-| naive — direct 2D convolution | 0.182 | — |
-| separable — two 1D passes | 0.106 | 1.72× |
-| shared — tiled with halo regions | **0.092** | **1.98×** |
+| naive — direct 2D convolution | 0.181 | — |
+| separable — two 1D passes | 0.106 | 1.71× |
+| shared — tiled with halo regions | **0.090** | **2.02×** |
 
 ![Blur speedup vs naive](results/bench_speedup_vs_naive.png)
 
-**Processing time, all three stages.** Benchmark sweep: median of per-frame samples over repeated passes on in-memory frames, with no video decode in the loop.
+**Whole pipeline at 1080p, ms/frame:**
 
-| | ms/frame |
-|---|---|
-| OpenCV CPU baseline (multithreaded SIMD) | 5.686 |
-| CUDA kernels, compute only | **0.240** |
-| CUDA + PCIe transfer both ways | 0.935 |
+| | processing only | + PCIe transfer | + decode and encode |
+|---|---|---|---|
+| OpenCV CPU | 4.372 | — | — |
+| custom CUDA | **0.209** | 0.902 | 9.867 (**101 fps**) |
 
-**End-to-end video throughput.** A separate run over the full 1080p clip, mean across 200 frames, including CPU decode and encode.
+<sub>Processing figures come from the benchmark sweep (median over in-memory frames); the end-to-end figure from a separate full-clip run with decode interleaved. See [docs/OPTIMIZATION.md](docs/OPTIMIZATION.md).</sub>
 
-| | ms/frame | rate |
-|---|---|---|
-| Kernels | 0.319 | |
-| + PCIe transfer | 1.170 | |
-| **+ decode and encode** | **9.867** | **101 fps** |
-
-The kernel figure differs between the two tables (0.240 vs 0.319 ms) because they are different measurements: the sweep takes a median over repeated passes on cached frames, while the end-to-end run takes a mean with video decode interleaved between frames. Both are real; neither corrects the other.
-
-**On "real-time":** the source is 30 fps and end-to-end throughput is 101 fps, so the pipeline runs at roughly 3.4× real-time including decode and encode. Kernel-only throughput is about 10× higher and describes GPU processing, not pipeline throughput. 4K end-to-end was not measured — the 4K rows in the CSV are compute-only, on resized frames.
+The source clip is 30 fps, so end-to-end throughput of 101 fps is roughly 3.4×
+real time including CPU decode and encode. Kernel-only throughput is about 10×
+higher and describes GPU processing, not pipeline throughput — the two are not
+interchangeable. Decode and encode dominate the end-to-end figure.
 
 Full sweep, 3 variants × 4 resolutions: [results/benchmarks.csv](results/benchmarks.csv), plots in `results/`.
 
@@ -94,32 +88,76 @@ Device buffers are allocated once and reused across frames. The three kernels ch
 
 Shared-memory tiling made **Sobel slower**, 0.068 ms against 0.047 ms for the naive version, reproduced across three runs. A 3×3 stencil has much less overlap between neighbouring threads than a 5×5, so there is less reuse to recover, and staging through shared memory adds a load loop, a type conversion and a block-wide barrier. This is consistent with the redundant reads already being served largely from cache, though confirming that would require profiling.
 
-The consequence is that the `shared` variant is marginally slower overall than `separable` (0.240 vs 0.234 ms kernel total), since the Sobel regression cancels the blur gain. The fastest measured combination is shared-memory blur with naive Sobel.
+The consequence is that the `shared` variant is marginally slower overall than `separable` (0.209 vs 0.205 ms kernel total), since the Sobel regression cancels the blur gain. The fastest measured combination is shared-memory blur with naive Sobel.
 
 Detailed memory-traffic analysis, kernel-size sweeps and theory-vs-measurement comparison: **[docs/OPTIMIZATION.md](docs/OPTIMIZATION.md)**.
 
 ---
 
+## GPU baseline: NVIDIA NPP
+
+An OpenCV **CPU** baseline only shows that a GPU beats a CPU. This compares the
+custom kernels against a vendor-optimised **GPU** library.
+
+OpenCV CUDA was unavailable in the installed Windows build, so **NVIDIA NPP**
+was used as the GPU-library baseline. NPP convolves with this project's own
+Gaussian weights and uses the same timing, warmup and median statistic.
+
+**1920×1080, ms/frame:**
+
+| | grayscale | blur | sobel | compute | + transfer |
+|---|---|---|---|---|---|
+| **NPP** | 0.045 | **0.038** | 0.061 | **0.144** | **0.836** |
+| custom naive | 0.053 | 0.181 | **0.047** | 0.280 | 0.982 |
+| custom separable | 0.053 | 0.106 | **0.047** | 0.205 | 0.972 |
+| custom shared | 0.051 | 0.090 | 0.068 | 0.209 | 0.902 |
+
+**NPP ÷ custom** — above 1 means the custom kernel is faster:
+
+| resolution | blur | sobel | compute | + transfer |
+|---|---|---|---|---|
+| 640×480 | 0.65 | **1.80** | 1.00 | **1.05** |
+| 1280×720 | 0.48 | **1.43** | 0.82 | 0.97 |
+| 1920×1080 | 0.43 | **1.30** | 0.70 | 0.93 |
+| 3840×2160 | 0.24 | **1.72** | 0.58 | 0.89 |
+
+**NPP wins the full compute pipeline from 720p upward** — 1.4× at 1080p, 1.7× at
+4K — driven by its Gaussian blur. **The custom fused Sobel is faster at every
+resolution, by 1.30× to 1.80×**, because NPP has no fused gradient-magnitude call
+and needs two passes plus a combine step. Including PCIe transfers narrows the
+difference to within roughly 10%.
+
+Detailed methodology and analysis: [docs/OPTIMIZATION.md](docs/OPTIMIZATION.md).
+
+## Profiling
+
+Nsight Compute 2026.2.1, shared variant at 1080p:
+
+| kernel | achieved occupancy | notes |
+|---|---|---|
+| grayscale | ~75% | ~95 GB/s; L1TEX and scoreboard stalls |
+| blur, horizontal | ~86% | ~65% compute utilisation |
+| blur, vertical | ~87% | ~99 GB/s |
+| sobel | ~90% | |
+
+At 75–90%, occupancy is not the limit. The latency and memory-dependency stalls
+point at memory access patterns, and the separable float32 intermediate moves
+20.74 MB per 1080p frame against NPP's 4.15 MB. **No optimization has been
+applied on the basis of these numbers.**
+
 ## Validation
 
-GPU output is checked three ways.
+Correctness is checked three ways: against **OpenCV**, against a **NumPy
+reference** written from the mathematical definition in float64, and against
+**NVIDIA NPP**.
 
-**Against OpenCV**, with matched kernel size, sigma and `BORDER_REFLECT_101` border handling. Because the CUDA kernels implement the same border mode, the comparison covers the entire image with no excluded pixels.
+- Against OpenCV the comparison covers the full image with no excluded pixels, because the CUDA kernels implement the same `BORDER_REFLECT_101` border mode. Mean absolute error at 1080p: 0.00002 grayscale, 0.00495 blur, 0.02470 Sobel.
+- Against the NumPy reference all three stages are **bit-exact**.
+- The three kernel variants are checked against each other at a resolution that is not a multiple of the thread-block size, so partial edge tiles are exercised. Separable and shared agree bit-exactly.
+- NPP comparisons account for differences in border handling and rounding, and are gated on a derived maximum-difference bound rather than a mean.
 
-```
-20 frames at 1920x1080, 2,073,600 px/frame, 0 border pixels excluded
-
-stage        mean abs   max abs   px differing >1
-Grayscale     0.00002         1                 0
-Blur          0.00495         1                 0
-Sobel         0.02470         8            15,817     PASSED (tolerance: mean <= 1.0)
-```
-
-The Sobel maximum of 8 is inherited rounding, not a defect: the Sobel weights sum to 8 in absolute value, so a one-level difference in the blurred input can move the gradient by up to 8 levels. Blur differs by at most 1 because OpenCV uses fixed-point coefficients.
-
-**Against a NumPy oracle** (`scripts/verify_stages.py`), written from the mathematical definition in float64. OpenCV dispatches to fixed-point SIMD paths that vary by build and CPU, so it is a useful reference but not a bit-exact one. Against NumPy, all three stages are bit-exact.
-
-**Variants against each other** (`scripts/compare_variants.py`), at 642×482 — deliberately not a multiple of the 16×16 block, so partial edge tiles are exercised. Separable and shared agree bit-exactly; naive differs by one level at a single pixel, from floating-point associativity.
+Methodology, error bounds and the NPP semantic differences are documented in
+[docs/OPTIMIZATION.md](docs/OPTIMIZATION.md).
 
 ---
 
@@ -193,5 +231,6 @@ C++17 · CUDA C++ (Runtime API) · CMake · NVCC · OpenCV (I/O and CPU baseline
 
 - **NVDEC/NVENC hardware codecs** — decode and encode are roughly 88% of end-to-end time, making this the highest-value change
 - **Pinned memory and CUDA streams** to overlap transfer with compute; PCIe transfer currently costs more than the kernels
-- **Nsight Compute profiling** to confirm the cache and memory-throughput explanations above against hardware counters
+- **Reduce the separable intermediate** from float32 to `uint8` or `__half`, cutting the 20.74 MB/frame the blur currently moves; the NPP comparison points here first
+- **Process multiple output pixels per thread** in the blur kernels, to close part of the gap against NPP's 2D convolution
 - **Full Canny** — non-maximum suppression and hysteresis for thin, connected edges

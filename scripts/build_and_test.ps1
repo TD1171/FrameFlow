@@ -181,6 +181,15 @@ Step "edge variants agree (tolerance 8, Sobel amplification bound)" {
     if ($LASTEXITCODE -ne 0) { throw "edge variants disagree beyond amplification bound" }
 }
 
+# --validate runs the OpenCV CPU baseline and the NPP GPU baseline alongside the
+# custom kernels and exits non-zero if either disagrees beyond tolerance. This
+# guards the NPP comparison: performance numbers are only meaningful once the
+# two implementations are known to compute the same thing.
+Step "validates against CPU and NPP baselines" {
+    & $exe --input $variantClip --frames 3 --warmup 2 --validate | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "validation reported a mismatch (exit $LASTEXITCODE)" }
+}
+
 # Negative cases. Each asserts the binary REJECTED its input. The positive cases
 # above (which assert exit 0 and correct pixels) are the control proving these
 # are not passing merely because the binary is broken.

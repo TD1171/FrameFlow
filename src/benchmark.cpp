@@ -1,6 +1,7 @@
 #include "benchmark.h"
 
 #include "cpu_baseline.h"
+#include "gpu_baseline.h"
 #include "video_io.h"
 
 #include <opencv2/imgproc.hpp>
@@ -146,6 +147,44 @@ int run_benchmark(const BenchmarkOptions& opt) {
             cpu = {median(cg), median(cb), median(cs), median(ct)};
         }
 
+        // NPP depends only on resolution, so like the CPU baseline it is
+        // measured once per resolution rather than once per custom variant.
+        // Written to the CSV as variant "npp", which needs no schema change.
+        StageStats npp{};
+        double npp_gpu_total = 0.0;
+        bool npp_ok = false;
+        try {
+            NppBaseline baseline(res.width, res.height, opt.ksize, opt.sigma);
+            cv::Mat out;
+            FrameTimings t{};
+            for (int i = 0; i < opt.warmup; ++i) baseline.process(frames[0], out, t);
+
+            std::vector<double> ng, nb, ns, nk, ntot;
+            for (int rep = 0; rep < opt.repeats; ++rep) {
+                for (const cv::Mat& f : frames) {
+                    baseline.process(f, out, t);
+                    ng.push_back(t.gray_ms);
+                    nb.push_back(t.blur_ms);
+                    ns.push_back(t.sobel_ms);
+                    nk.push_back(t.kernel_ms);
+                    ntot.push_back(t.gpu_total_ms);
+                }
+            }
+            npp = {median(ng), median(nb), median(ns), median(nk)};
+            npp_gpu_total = median(ntot);
+            npp_ok = true;
+        } catch (const std::exception& e) {
+            std::printf("%-11s %-10s SKIPPED: %s\n", res.label, "npp", e.what());
+        }
+
+        if (npp_ok) {
+            write_rows(csv, res, "npp", npp, cpu, npp_gpu_total);
+            std::printf("%-11s %-10s %8.3f %8.3f %8.3f %9.3f %10.3f %9.3f\n",
+                        res.label, "npp", npp.gray, npp.blur, npp.sobel, npp.total,
+                        npp_gpu_total, cpu.total);
+            ++completed;
+        }
+
         for (Variant variant : kVariants) {
             try {
                 // Scoped so the pipeline is destroyed before the next one is
@@ -199,7 +238,9 @@ int run_benchmark(const BenchmarkOptions& opt) {
 
     std::printf("\nWrote %d configurations to %s\n", completed, opt.csv_path.c_str());
     std::printf("All times are milliseconds per frame. 'kernel' excludes H2D/D2H\n");
-    std::printf("transfer; 'gpu_total' includes it; neither includes decode or encode.\n\n");
+    std::printf("transfer; 'gpu_total' includes it; neither includes decode or encode.\n");
+    std::printf("Variant 'npp' is the NVIDIA Performance Primitives baseline: same\n");
+    std::printf("Gaussian weights, same timing method, single 2D convolution.\n\n");
     return EXIT_SUCCESS;
 }
 

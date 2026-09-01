@@ -73,6 +73,40 @@ void CpuBaseline::process(const cv::Mat& bgr, cv::Mat& gray, cv::Mat& blurred,
     timings.total_ms = ms_since(t_all);
 }
 
+StageError compare_u8_interior(const cv::Mat& a, const cv::Mat& b, int margin) {
+    if (a.size() != b.size() || a.type() != b.type() || a.type() != CV_8UC1) {
+        throw std::runtime_error("compare_u8_interior requires two same-size CV_8UC1 images");
+    }
+    if (margin < 0) margin = 0;
+    if (a.cols <= 2 * margin || a.rows <= 2 * margin) {
+        throw std::runtime_error("margin leaves no interior region to compare");
+    }
+
+    StageError e;
+    double sum = 0.0;
+    int worst = 0;
+    long long over_one = 0;
+    long long n = 0;
+
+    for (int y = margin; y < a.rows - margin; ++y) {
+        const uint8_t* pa = a.ptr<uint8_t>(y);
+        const uint8_t* pb = b.ptr<uint8_t>(y);
+        for (int x = margin; x < a.cols - margin; ++x) {
+            const int d = std::abs(static_cast<int>(pa[x]) - static_cast<int>(pb[x]));
+            sum += d;
+            if (d > worst) worst = d;
+            if (d > 1) ++over_one;
+            ++n;
+        }
+    }
+
+    e.pixels = n;
+    e.mean_abs = sum / static_cast<double>(n);
+    e.max_abs = worst;
+    e.over_one = over_one;
+    return e;
+}
+
 StageError compare_u8(const cv::Mat& a, const cv::Mat& b) {
     if (a.size() != b.size() || a.type() != b.type() || a.type() != CV_8UC1) {
         throw std::runtime_error("compare_u8 requires two same-size CV_8UC1 images");

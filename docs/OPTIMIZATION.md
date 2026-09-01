@@ -9,8 +9,10 @@ untimed warmup iterations, median of per-frame samples, launch-error checking
 only with no per-launch synchronize.
 
 A note on what follows: timings are measured. Explanations involving cache
-behaviour are inferences consistent with the measurements, not profiler results —
-no Nsight Compute profiling was performed. Those are marked where they appear.
+behaviour are inferences consistent with the measurements, not profiler results.
+Nsight Compute was later run to collect occupancy and memory-throughput figures
+(summarised in the README), but it was not used to confirm the cache hypotheses
+below. Those remain marked as inferences where they appear.
 
 ---
 
@@ -26,7 +28,7 @@ is 25 loads per output pixel.
   redundancy factor                =    16×
 ```
 
-**Measured:** 0.182 ms at 1080p.
+**Measured:** 0.181 ms at 1080p.
 
 ## 2. Separable — two 1D passes
 
@@ -103,10 +105,10 @@ the block.
 
 | resolution | separable | shared |
 |---|---|---|
-| 640×480 | 1.43× | 1.56× |
-| 1280×720 | 1.66× | 1.93× |
-| 1920×1080 | 1.72× | **1.98×** |
-| 3840×2160 | 1.14× | 1.29× |
+| 640×480 | 1.38× | 1.53× |
+| 1280×720 | 1.65× | 1.93× |
+| 1920×1080 | 1.71× | **2.02×** |
+| 3840×2160 | 1.26× | 1.44× |
 
 **Tiling benefit grows with stencil size**, which is what the reuse argument
 predicts:
@@ -119,7 +121,7 @@ predicts:
 | 21 | 0.301 | 0.152 | **1.98×** |
 
 **The 4K regression.** At 3840×2160 the separable float intermediate is 33 MB.
-The drop from 1.98× to 1.29× is consistent with the intermediate exceeding cache
+The drop from 2.02× to 1.44× is consistent with the intermediate exceeding cache
 capacity, so the extra traffic it introduces offsets more of what the tap
 reduction saves. Confirming that this is the mechanism would require profiling
 memory throughput and cache hit rates; it has not been done. Either way, the
@@ -166,7 +168,7 @@ largely from cache, in which case shared memory replaces cheap hits with explici
 staging. Confirming that would require profiling. *(Inference, not profiled.)*
 
 The consequence is that `shared` is marginally slower overall than `separable`
-(0.240 vs 0.234 ms kernel total at 1080p), because the Sobel regression cancels
+(0.209 vs 0.205 ms kernel total at 1080p), because the Sobel regression cancels
 the blur gain. The fastest measured combination is shared-memory blur with naive
 Sobel.
 
@@ -194,13 +196,15 @@ not crippled for the comparison. Blur at 1080p:
 
 | variant | GPU | OpenCV CPU | speedup |
 |---|---|---|---|
-| naive | 0.182 ms | 0.216 ms | 1.19× |
-| separable | 0.106 ms | 0.216 ms | 2.04× |
-| shared | 0.092 ms | 0.216 ms | **2.36×** |
+| naive | 0.181 ms | 0.194 ms | 1.07× |
+| separable | 0.106 ms | 0.194 ms | 1.83× |
+| shared | 0.090 ms | 0.194 ms | **2.16×** |
 
-The naive GPU blur beats well-vectorised CPU code by only 19%; the optimizations
-roughly double that margin. Across the whole pipeline the speedup is 23.7× on
-kernel time and 6.1× once PCIe transfers are included.
+The naive GPU blur barely beats well-vectorised CPU code at all; the optimizations
+take the margin to 2.16×. Across the whole pipeline the speedup is 20.9× on
+kernel time and 4.8× once PCIe transfers are included. The multithreaded OpenCV
+CPU baseline is more sensitive to system load and can vary between runs, so
+treat CPU-relative ratios as approximate. NPP is the primary GPU comparison.
 
 ---
 
@@ -217,3 +221,73 @@ kernel time and 6.1× once PCIe transfers are included.
   synchronous copies from pageable memory, so the GPU is idle when the
   post-upload event is recorded and the first kernel's launch latency lands
   inside the span.
+
+---
+
+## Validation methodology
+
+Three independent checks, all on 20 frames at 1920x1080 unless stated.
+
+**Against OpenCV**, with matched kernel size, sigma and `BORDER_REFLECT_101`.
+Because the CUDA kernels implement the same border mode, the comparison covers
+the entire image with no excluded pixels.
+
+```
+stage        mean abs   max abs   px differing >1
+Grayscale     0.00002         1                 0
+Blur          0.00495         1                 0
+Sobel         0.02470         8            15,817     PASSED (tolerance: mean <= 1.0)
+```
+
+The Sobel maximum of 8 is inherited rounding, not a defect: the Sobel weights sum
+to 8 in absolute value, so a one-level difference in the blurred input can move
+the gradient by up to 8 levels. Blur differs by at most 1 because OpenCV uses
+fixed-point coefficients.
+
+**Against a NumPy oracle** (`scripts/verify_stages.py`), written from the
+mathematical definition in float64. OpenCV dispatches to fixed-point SIMD paths
+that vary by build and CPU, so it is a useful reference but not a bit-exact one.
+Against NumPy, all three stages are bit-exact.
+
+**Variants against each other** (`scripts/compare_variants.py`) at 642x482 --
+deliberately not a multiple of the 16x16 block, so partial edge tiles are
+exercised. Separable and shared agree bit-exactly; naive differs by one level at
+a single pixel, from floating-point associativity.
+
+**Against NPP**, with two differences that cannot be eliminated:
+
+- **Border mode.** NPP's convolution and Sobel accept only
+  `NPP_BORDER_REPLICATE`; `MIRROR`, `CONSTANT` and `WRAP` return
+  `NPP_NOT_SUPPORTED_MODE_ERROR`. Blur and Sobel are therefore compared on the
+  interior with a 4-pixel margin excluded, 1.15% of pixels at 1080p. Grayscale
+  reads no neighbours and is compared over the full image.
+- **Rounding.** NPP truncates where these kernels round. Measured against a
+  float64 reference, `NPP - round(exact)` is `-1` on 50.3% of pixels and `0` on
+  the rest, never `+1`. These kernels round half to even because that matches
+  OpenCV.
+
+Because that rounding difference is systematic, the NPP check is gated on the
+**maximum** difference against a derived bound rather than the mean: 1 level for
+grayscale and blur, since rounding cannot exceed one level, and 8 for Sobel, the
+sum of the Sobel weights. Measured at 1080p: max 1, 1 and 5. The blur result sits
+exactly at its limit, so any further disagreement fails the check.
+
+## Why two different kernel timings appear
+
+The benchmark sweep reports 0.209 ms of kernel time at 1080p while the
+end-to-end run reports 0.319 ms. They are different measurements: the sweep takes
+a median over repeated passes on in-memory frames, the end-to-end run takes a
+mean with video decode interleaved between frames. Both are real; neither
+corrects the other.
+
+4K end-to-end was never measured. The 4K rows in `results/benchmarks.csv` are
+compute-only, on resized frames.
+
+## NPP compared to the custom naive kernel
+
+The most informative comparison for judging the custom code is `custom naive`
+against NPP: same algorithm, same weights, same byte traffic, and NPP is 2.3x to
+5.9x faster. That isolates the difference as implementation quality rather than
+algorithm choice. The custom optimizations remain real and measurable -- blur
+falls from 0.181 to 0.090 ms at 1080p, a 2.02x improvement -- but they do not
+close the gap to NPP.
